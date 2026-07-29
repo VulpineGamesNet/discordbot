@@ -1,0 +1,20 @@
+# Secrets and deployment-specific config
+.env
+config.toml
+minecraft/**/config/discord.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Claude
+.claude/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

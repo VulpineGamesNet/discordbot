@@ -1,0 +1,41 @@
+# Copy to config.toml and fill in.
+#
+# Structural config lives here. Secrets come from the environment (or .env)
+# through ${VAR} placeholders - a missing ${VAR} is a hard startup error.
+# To write a literal "$" in a value, escape it as "$$".
+
+[discord]
+token = "${DISCORD_TOKEN}"
+# Optional. With a guild id, slash commands appear instantly in that server.
+# Omit it for a global sync (can take up to an hour to propagate).
+guild_id = 123456789012345678
+
+# Applied to every [[servers]] block. Any key here may be overridden per server.
+[defaults]
+stats_check_interval = 5     # RCON getstats poll, seconds
+events_poll_interval = 2     # discord_events DB poll, seconds
+max_message_length   = 256   # truncation before relaying to Minecraft
+offline_threshold    = 12    # consecutive failed stat checks before "restarting..."
+status_cooldown      = 30    # min seconds between online/offline embeds
+icon_url = "https://raw.githubusercontent.com/VulpineGamesNet/minecraft-discord-bot/main/resources/vulpines.png"
+
+# One block per Minecraft server. Each needs its own Discord channel and its
+# own MySQL database - the discord_events table is not shared between servers.
+[[servers]]
+name          = "ATM10"                     # shown in embeds, webhook name, presence, log prefix
+channel_id    = 111111111111111111
+rcon_host     = "atm10"
+rcon_port     = 25575
+rcon_password = "${ATM10_RCON_PASSWORD}"
+database_url  = "${ATM10_DATABASE_URL}"     # jdbc:mysql:// and mysql:// both accepted
+# webhook_url = "${ATM10_WEBHOOK_URL}"      # only if the bot lacks MANAGE_WEBHOOKS
+# icon_url    = "https://example.com/atm10.png"   # overrides [defaults].icon_url
+
+[[servers]]
+name              = "DeceasedCraft"
+channel_id        = 222222222222222222
+rcon_host         = "deceasedcraft"
+rcon_port         = 25575
+rcon_password     = "${DECEASEDCRAFT_RCON_PASSWORD}"
+database_url      = "${DECEASEDCRAFT_DATABASE_URL}"
+offline_threshold = 20                      # per-server override: slower restarts

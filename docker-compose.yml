@@ -1,0 +1,19 @@
+services:
+  discord-bot:
+    build: .
+    container_name: minecraft-discord-bot
+    restart: unless-stopped
+    stop_grace_period: 15s
+    env_file:
+      - .env
+    volumes:
+      # Mounted, not baked into the image: adding or editing a server is a
+      # restart, not a rebuild.
+      - ./config.toml:/app/config.toml:ro
+    networks:
+      - pterodactyl_nw
+
+# Use external Pterodactyl network for RCON access
+networks:
+  pterodactyl_nw:
+    external: true

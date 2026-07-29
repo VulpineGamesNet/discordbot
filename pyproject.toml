@@ -1,0 +1,30 @@
+[project]
+name = "minecraft-discord-bot"
+version = "1.0.0"
+description = "Discord bot for Minecraft chat sync and server status"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "discord-py>=2.3.0",
+    "python-dotenv>=1.0.0",
+    "Pillow>=10.0.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "asyncmy>=0.2.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=4.0.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v"
+
+[tool.coverage.run]
+source = ["bot", "config"]
+omit = ["tests/*"]
