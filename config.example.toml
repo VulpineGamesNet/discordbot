@@ -17,7 +17,7 @@ events_poll_interval = 2     # discord_events DB poll, seconds
 max_message_length   = 256   # truncation before relaying to Minecraft
 offline_threshold    = 12    # consecutive failed stat checks before "restarting..."
 status_cooldown      = 30    # min seconds between online/offline embeds
-icon_url = "https://raw.githubusercontent.com/VulpineGamesNet/minecraft-discord-bot/main/resources/vulpines.png"
+icon_url = "https://raw.githubusercontent.com/VulpineGamesNet/discordbot/main/resources/vulpines.png"
 
 # One block per Minecraft server. Each needs its own Discord channel and its
 # own MySQL database - the discord_events table is not shared between servers.
