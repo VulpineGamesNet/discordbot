@@ -13,7 +13,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 # Copy application code
-COPY bot.py config.py database.py models.py ./
+COPY bot.py config.py database.py models.py rcon.py ./
 
 # Set uv cache to writable location
 ENV UV_CACHE_DIR=/app/.cache/uv

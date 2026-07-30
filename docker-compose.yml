@@ -6,6 +6,10 @@ services:
     stop_grace_period: 15s
     env_file:
       - .env
+    # Non-root. No host volumes are mounted, so this uid only needs to read
+    # config.toml - keep that file world-readable (it holds no secrets, only
+    # ${VAR} placeholders resolved from .env by the process itself).
+    user: "997:988"
     volumes:
       # Mounted, not baked into the image: adding or editing a server is a
       # restart, not a rebuild.

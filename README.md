@@ -57,6 +57,17 @@ If one server's RCON or database is down, the others keep working.
    Or without Docker: `uv run python bot.py` (set `BOT_CONFIG` to use a config
    path other than `./config.toml`).
 
+## Sending RCON commands
+
+```bash
+uv run python rcon.py "Vulpine ATM10" getstats
+uv run python rcon.py "Vulpine ATM10" kubejs reload server-scripts
+```
+
+Reloading re-runs the KubeJS script bodies, but **does not** rebuild the command
+tree — edits to `getstats` / `discordmsg` / `discordstatus` need a full Minecraft
+server restart to take effect.
+
 ## Adding a server
 
 Append a `[[servers]]` block to `config.toml`, add its two secrets to `.env`,
