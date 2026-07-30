@@ -76,10 +76,17 @@ change and no slash-command re-sync.
 
 ## Discord bot permissions
 
-Send Messages, Embed Links, Attach Files, Read Message History, Manage
-Webhooks, Manage Channels (for the topic). Enable the **Message Content
-Intent** in the Developer Portal. Without Manage Webhooks, create a webhook by
-hand and set `webhook_url` in that server's block.
+Per bridged channel: **View Channel**, Send Messages, Embed Links, Attach
+Files, Read Message History, Manage Webhooks, Manage Channels (for the topic).
+Enable the **Message Content Intent** in the Developer Portal. Without Manage
+Webhooks, create a webhook by hand and set `webhook_url` in that server's block.
+
+**If Minecraft chat reaches Discord but Discord chat never reaches Minecraft,
+check View Channel first.** Posting happens through a webhook, which keeps
+working without it, so join/leave embeds and relayed chat all look healthy —
+but Discord only delivers message events for channels the bot can see, so
+`on_message` never fires and the bot logs nothing at all. A total absence of
+`Relaying message from ...` lines for one channel is the signature.
 
 ## Development
 
