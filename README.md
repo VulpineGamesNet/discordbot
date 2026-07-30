@@ -64,6 +64,10 @@ uv run python rcon.py "Vulpine ATM10" getstats
 uv run python rcon.py "Vulpine ATM10" kubejs reload server-scripts
 ```
 
+The reload argument differs per KubeJS major version — ATM10 (KubeJS 7) wants
+`server-scripts` with a hyphen, DeceasedCraft (KubeJS 6) wants `server_scripts`
+with an underscore.
+
 Reloading re-runs the KubeJS script bodies, but **does not** rebuild the command
 tree — edits to `getstats` / `discordmsg` / `discordstatus` need a full Minecraft
 server restart to take effect.

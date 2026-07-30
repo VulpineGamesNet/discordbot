@@ -6,9 +6,15 @@ needing a shell inside the Minecraft container.
     uv run python rcon.py "Vulpine ATM10" getstats
     uv run python rcon.py "Vulpine ATM10" kubejs reload server-scripts
 
-Note: KubeJS spells it `server-scripts` here (hyphen), and reloading re-runs the
-script bodies but does NOT rebuild the Brigadier command tree - changes to the
-registered commands need a full server restart.
+The reload argument is spelled differently per KubeJS major version, and the
+wrong one just errors:
+
+    KubeJS 7 (2101, MC 1.21.1)  ->  kubejs reload server-scripts   (hyphen)
+    KubeJS 6 (2001, MC 1.20.1)  ->  kubejs reload server_scripts   (underscore)
+
+Either way, reloading re-runs the script bodies but does NOT rebuild the
+Brigadier command tree - changes to the registered commands only take effect
+once the Minecraft server itself is started again.
 """
 
 import socket
