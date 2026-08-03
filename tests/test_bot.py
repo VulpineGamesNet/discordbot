@@ -638,19 +638,91 @@ class TestServerStatusDetection:
 
     @pytest.mark.asyncio
     async def test_server_goes_offline(self, bridge):
-        """Test detection when server goes offline after threshold consecutive failures."""
+        """Offline once the server has been unreachable for the whole window."""
         bridge.server_online = True
+        clock = [1000.0]
 
-        with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock, return_value=None):
-            with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as mock_embed:
-                # Need OFFLINE_THRESHOLD consecutive failures to trigger offline
-                for _ in range(bridge.OFFLINE_THRESHOLD):
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock, return_value=None):
+                with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as mock_embed:
+                    # Poll at the nominal interval until the window has elapsed
+                    while clock[0] < 1000.0 + bridge.OFFLINE_AFTER_SECONDS:
+                        await bridge.poll_server_stats()
+                        clock[0] += bridge.config.settings.stats_check_interval
                     await bridge.poll_server_stats()
 
         assert bridge.server_online is False
         mock_embed.assert_called_once()
         # author_name is the 4th argument (index 3)
         assert "restarting" in mock_embed.call_args[0][3].lower()
+
+    @pytest.mark.asyncio
+    async def test_offline_detected_even_when_checks_are_slow(self, bridge):
+        """The window is real seconds, not a count of checks.
+
+        A sick server makes each check take far longer than the poll interval -
+        a hung RCON read costs 30s or more - so only a handful of checks
+        complete during an outage. Counting checks meant ATM10 was down four
+        minutes on 2026-08-03, completed eight checks against a threshold of
+        twelve, and was never announced.
+        """
+        bridge.server_online = True
+        clock = [1000.0]
+        # Three checks spanning five minutes, far fewer than OFFLINE_THRESHOLD
+        gaps = [39.0, 167.0, 50.0]
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock, return_value=None):
+                with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as mock_embed:
+                    for gap in gaps:
+                        await bridge.poll_server_stats()
+                        clock[0] += gap
+                    await bridge.poll_server_stats()
+
+        assert bridge.consecutive_offline_checks < bridge.OFFLINE_THRESHOLD
+        assert bridge.server_online is False
+        mock_embed.assert_called_once()
+        assert "restarting" in mock_embed.call_args[0][3].lower()
+
+    @pytest.mark.asyncio
+    async def test_brief_blip_does_not_mark_offline(self, bridge):
+        """A dropped packet inside the window must not raise a false alarm."""
+        bridge.server_online = True
+        clock = [1000.0]
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock, return_value=None):
+                with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as mock_embed:
+                    await bridge.poll_server_stats()
+                    clock[0] += bridge.OFFLINE_AFTER_SECONDS - 1
+                    await bridge.poll_server_stats()
+
+        assert bridge.server_online is True
+        mock_embed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_recovery_resets_the_failure_window(self, bridge):
+        """A server that answers again restarts the clock, so old failures
+        cannot accumulate across separate incidents."""
+        bridge.server_online = True
+        stats = {"tps": 20.0, "playerCount": 0}
+        clock = [1000.0]
+        responses = [None, stats, None]
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock,
+                              side_effect=responses):
+                with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
+                    await bridge.poll_server_stats()           # fail, window opens
+                    first_open = bridge.first_failed_check
+                    clock[0] += 500.0
+                    await bridge.poll_server_stats()           # success, window clears
+                    assert bridge.first_failed_check is None
+                    await bridge.poll_server_stats()           # fail, window reopens
+
+        assert bridge.first_failed_check is not None
+        assert bridge.first_failed_check != first_open
+        assert bridge.server_online is True
 
     @pytest.mark.asyncio
     async def test_server_stays_online(self, bridge):

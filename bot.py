@@ -77,6 +77,16 @@ class MinecraftBridge(commands.Cog):
         # Debounce settings (config-driven via config.settings)
         self.STATUS_COOLDOWN: int = config.settings.status_cooldown
         self.OFFLINE_THRESHOLD: int = config.settings.offline_threshold
+        # How long the server must be continuously unreachable before it is
+        # called offline. Expressed in seconds rather than a count of checks:
+        # a sick server makes each check take far longer than the poll
+        # interval (a hung RCON read costs 30s+), so counting checks silently
+        # stretches the window exactly when it matters. ATM10 was down four
+        # minutes on 2026-08-03 and only completed eight checks against a
+        # threshold of twelve, so nothing was ever announced.
+        self.OFFLINE_AFTER_SECONDS: float = (
+            config.settings.offline_threshold * config.settings.stats_check_interval
+        )
         self.last_stats: Optional[dict] = None
         self.rcon_lock = asyncio.Lock()
         self.last_topic: Optional[str] = None
@@ -86,6 +96,10 @@ class MinecraftBridge(commands.Cog):
         # Debounce state
         self.last_status_notification: float = 0
         self.consecutive_offline_checks: int = 0
+        # Timestamp of the first failed check in the current run of failures,
+        # None while the server is answering. This is what the offline decision
+        # is actually based on.
+        self.first_failed_check: Optional[float] = None
         # Persistent RCON connection state
         self._rcon_socket: Optional[socket.socket] = None
         self._rcon_connected: bool = False
@@ -157,8 +171,16 @@ class MinecraftBridge(commands.Cog):
         packet = struct.pack("<i", len(packet)) + packet
         sock.sendall(packet)
 
+    # A whole packet must arrive within this long. The socket timeout alone is
+    # not enough: it applies per recv() call, so a server dribbling bytes
+    # refreshes it indefinitely and one read can block for minutes. Seen on
+    # 2026-08-03, when a single call held the stats loop for 167 seconds.
+    RCON_READ_DEADLINE: float = 15.0
+
     def _rcon_recv_packet(self, sock: socket.socket) -> tuple[int, int, str]:
-        """Receive an RCON packet."""
+        """Receive an RCON packet, bounded by RCON_READ_DEADLINE overall."""
+        deadline = time.monotonic() + self.RCON_READ_DEADLINE
+
         length_data = sock.recv(4)
         if len(length_data) < 4:
             raise ConnectionError("Failed to read packet length")
@@ -166,6 +188,13 @@ class MinecraftBridge(commands.Cog):
 
         data = b""
         while len(data) < length:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConnectionError(
+                    f"Timed out after {self.RCON_READ_DEADLINE}s with "
+                    f"{len(data)}/{length} bytes of the packet"
+                )
+            sock.settimeout(min(remaining, 30.0))
             chunk = sock.recv(length - len(data))
             if not chunk:
                 raise ConnectionError("Connection closed by server")
@@ -523,6 +552,7 @@ class MinecraftBridge(commands.Cog):
         if stats:
             self.last_stats = stats
             self.consecutive_offline_checks = 0  # Reset offline counter
+            self.first_failed_check = None
 
             if not self.server_online:
                 self.server_online = True
@@ -539,9 +569,14 @@ class MinecraftBridge(commands.Cog):
                     self.log.info("Server came online - notification skipped (cooldown)")
         else:
             self.consecutive_offline_checks += 1
+            if self.first_failed_check is None:
+                self.first_failed_check = now
+            unreachable_for = now - self.first_failed_check
 
-            # Only mark offline after threshold consecutive failures
-            if self.server_online and self.consecutive_offline_checks >= self.OFFLINE_THRESHOLD:
+            # Mark offline once the server has been unreachable for the whole
+            # window. Deliberately not a count of checks - see
+            # OFFLINE_AFTER_SECONDS.
+            if self.server_online and unreachable_for >= self.OFFLINE_AFTER_SECONDS:
                 self.server_online = False
                 # Only notify if cooldown has passed
                 if now - self.last_status_notification >= self.STATUS_COOLDOWN:
