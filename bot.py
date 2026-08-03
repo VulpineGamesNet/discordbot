@@ -87,6 +87,10 @@ class MinecraftBridge(commands.Cog):
         self.OFFLINE_AFTER_SECONDS: float = (
             config.settings.offline_threshold * config.settings.stats_check_interval
         )
+        # A refused connection is not ambiguous: nothing is listening on the
+        # port, so the process is gone rather than merely slow. That needs no
+        # patience, unlike a timeout which may just be a struggling server.
+        self.OFFLINE_REFUSED_AFTER_SECONDS: float = 2 * config.settings.stats_check_interval
         self.last_stats: Optional[dict] = None
         self.rcon_lock = asyncio.Lock()
         self.last_topic: Optional[str] = None
@@ -100,9 +104,24 @@ class MinecraftBridge(commands.Cog):
         # None while the server is answering. This is what the offline decision
         # is actually based on.
         self.first_failed_check: Optional[float] = None
+        # False until the first poll has told us what the server is doing. The
+        # bot starts assuming offline, so without this the first successful
+        # poll looks like a transition and announces "is now online" for a
+        # server that never went anywhere - only the bot restarted.
+        self._status_known: bool = False
         # Persistent RCON connection state
         self._rcon_socket: Optional[socket.socket] = None
         self._rcon_connected: bool = False
+        # True when the last attempt was refused outright, i.e. nothing is
+        # listening. Distinguishes "process is gone" from "process is wedged".
+        self._rcon_refused: bool = False
+        # Server log watching (optional, only when log_path is configured)
+        self.log_path: str = config.minecraft.log_path
+        self._log_pos: int = 0
+        self._log_inode: Optional[int] = None
+        # Set once a crash marker has been announced, cleared when the server
+        # answers again, so one incident produces one message.
+        self._crash_announced: bool = False
         # Database manager for Discord events
         self.db_manager: DatabaseManager = DatabaseManager(config.database, server_name)
 
@@ -116,12 +135,17 @@ class MinecraftBridge(commands.Cog):
             self.log.warning("Database not available - discord events polling disabled")
         self.poll_server_stats.start()
         self.update_channel_topic.start()
+        if self.log_path:
+            self.watch_server_log.start()
+            self.log.info("Watching server log at %s", self.log_path)
         self.log.info("MinecraftBridge cog loaded")
 
     async def cog_unload(self) -> None:
         """Called when cog is unloaded."""
         self.poll_server_stats.cancel()
         self.update_channel_topic.cancel()
+        if self.watch_server_log.is_running():
+            self.watch_server_log.cancel()
         if self.poll_discord_events.is_running():
             self.poll_discord_events.cancel()
         if self.http_session:
@@ -209,6 +233,7 @@ class MinecraftBridge(commands.Cog):
     def _rcon_connect(self) -> bool:
         """Establish persistent RCON connection with authentication."""
         self._rcon_disconnect()
+        self._rcon_refused = False
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -230,11 +255,15 @@ class MinecraftBridge(commands.Cog):
             sock.settimeout(30.0)
             self._rcon_socket = sock
             self._rcon_connected = True
+            self._rcon_refused = False
             self.log.info("RCON connection established")
             return True
 
         except ConnectionRefusedError:
-            self.log.debug("RCON connection refused - server may be starting")
+            # Nothing is listening. Either the server has not started yet or
+            # the process is gone; poll_server_stats treats it as gone.
+            self._rcon_refused = True
+            self.log.debug("RCON connection refused - nothing listening on the port")
             return False
         except socket.timeout:
             self.log.warning("RCON connection timed out")
@@ -553,11 +582,18 @@ class MinecraftBridge(commands.Cog):
             self.last_stats = stats
             self.consecutive_offline_checks = 0  # Reset offline counter
             self.first_failed_check = None
+            self._crash_announced = False
 
             if not self.server_online:
                 self.server_online = True
+                if not self._status_known:
+                    # First look after startup: adopt the state, announce
+                    # nothing. Only transitions this bot actually watched
+                    # happen are worth reporting.
+                    self._status_known = True
+                    self.log.info("Server already up at startup - no notification")
                 # Only notify if cooldown has passed
-                if now - self.last_status_notification >= self.STATUS_COOLDOWN:
+                elif now - self.last_status_notification >= self.STATUS_COOLDOWN:
                     server_name = self.config.minecraft.server_name
                     await self._send_status_embed_with_retry(
                         self.EMBED_COLOR_BLUE,
@@ -569,14 +605,21 @@ class MinecraftBridge(commands.Cog):
                     self.log.info("Server came online - notification skipped (cooldown)")
         else:
             self.consecutive_offline_checks += 1
+            self._status_known = True
             if self.first_failed_check is None:
                 self.first_failed_check = now
             unreachable_for = now - self.first_failed_check
 
             # Mark offline once the server has been unreachable for the whole
             # window. Deliberately not a count of checks - see
-            # OFFLINE_AFTER_SECONDS.
-            if self.server_online and unreachable_for >= self.OFFLINE_AFTER_SECONDS:
+            # OFFLINE_AFTER_SECONDS. A refused port needs far less patience
+            # than a timeout, because it is not ambiguous.
+            window = (
+                self.OFFLINE_REFUSED_AFTER_SECONDS
+                if self._rcon_refused
+                else self.OFFLINE_AFTER_SECONDS
+            )
+            if self.server_online and unreachable_for >= window:
                 self.server_online = False
                 # Only notify if cooldown has passed
                 if now - self.last_status_notification >= self.STATUS_COOLDOWN:
@@ -639,6 +682,113 @@ class MinecraftBridge(commands.Cog):
             self.log.info("poll_server_stats loop restarted after crash")
         except Exception as e:
             self.log.error(f"Failed to restart poll_server_stats loop: {e}")
+
+    # Lines that mean the server is dying or gone. Ordered most specific
+    # first; the first match wins, so a crash report beats a plain stop.
+    LOG_CRASH_MARKERS = (
+        ("OutOfMemoryError", "ran out of memory"),
+        ("ServerHangWatchdog", "stopped responding (watchdog)"),
+        ("Preparing crash report", "crashed"),
+        ("This crash report has been saved", "crashed"),
+        ("Stopping the server", "is stopping"),
+    )
+    # Only inspect the tail of a burst; a crashing server can emit a very
+    # large report and none of it changes the verdict.
+    LOG_MAX_LINES_PER_TICK = 400
+
+    def _read_new_log_lines(self) -> list[str]:
+        """Return log lines written since the last read.
+
+        Handles rotation: Minecraft replaces latest.log on each boot, so a new
+        inode or a file shorter than our offset means start again from zero.
+        Blocking file IO, so callers run it in an executor.
+        """
+        try:
+            stat = os.stat(self.log_path)
+        except OSError:
+            return []
+
+        if self._log_inode is None:
+            # First look: start at the end so a restart does not replay history
+            self._log_inode = stat.st_ino
+            self._log_pos = stat.st_size
+            return []
+
+        if stat.st_ino != self._log_inode or stat.st_size < self._log_pos:
+            self.log.info("Server log rotated, following the new file")
+            self._log_inode = stat.st_ino
+            self._log_pos = 0
+
+        if stat.st_size == self._log_pos:
+            return []
+
+        try:
+            with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(self._log_pos)
+                data = f.read()
+                self._log_pos = f.tell()
+        except OSError as e:
+            self.log.debug(f"Could not read server log: {e}")
+            return []
+
+        return data.splitlines()[-self.LOG_MAX_LINES_PER_TICK:]
+
+    @tasks.loop(seconds=5)
+    async def watch_server_log(self) -> None:
+        """Announce a crash the moment the server writes about it.
+
+        RCON only reveals a problem once it stops answering, which during the
+        2026-08-03 out-of-memory crash took minutes. The log says so
+        immediately, and says why.
+        """
+        if not self.log_path or self._crash_announced:
+            return
+
+        loop = asyncio.get_event_loop()
+        lines = await loop.run_in_executor(None, self._read_new_log_lines)
+
+        for line in lines:
+            for marker, reason in self.LOG_CRASH_MARKERS:
+                if marker in line:
+                    await self._announce_from_log(reason, line)
+                    return
+
+    async def _announce_from_log(self, reason: str, line: str) -> None:
+        """Post a crash notice found in the log and suppress the RCON one."""
+        self._crash_announced = True
+        server_name = self.config.minecraft.server_name
+        self.log.warning("Server log reports it %s: %s", reason, line.strip()[:200])
+
+        # Claim the status transition so poll_server_stats does not repeat it
+        was_online = self.server_online
+        self.server_online = False
+        self.first_failed_check = time.time()
+        if not was_online:
+            return
+
+        await self._send_status_embed_with_retry(
+            self.EMBED_COLOR_ORANGE,
+            f"{server_name} {reason}",
+            log_label="Crash detected in server log",
+        )
+        self.last_status_notification = time.time()
+
+    @watch_server_log.before_loop
+    async def before_watch_log(self) -> None:
+        await self.bot.wait_until_ready()
+
+    @watch_server_log.error
+    async def watch_server_log_error(self, error: BaseException) -> None:
+        self.log.error(
+            "watch_server_log loop crashed:\n%s",
+            "".join(traceback.format_exception(type(error), error, error.__traceback__)),
+        )
+        await asyncio.sleep(30)
+        try:
+            self.watch_server_log.restart()
+            self.log.info("watch_server_log loop restarted after crash")
+        except Exception as e:
+            self.log.error(f"Failed to restart watch_server_log loop: {e}")
 
     def sanitize_discord_message(self, content: str) -> str:
         """Sanitize Discord message for Minecraft."""

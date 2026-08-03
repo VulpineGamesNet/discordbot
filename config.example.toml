@@ -37,6 +37,12 @@ rcon_host     = "284c8202-2eb5-4ba2-b7b9-519145422945"
 rcon_port     = 25575
 rcon_password = "${ATM10_RCON_PASSWORD}"
 database_url  = "${ATM10_DATABASE_URL}"     # jdbc:mysql:// and mysql:// both accepted
+# Optional. Path *inside this container* to the server's latest.log. When set,
+# a crash is announced the moment the server writes about it, with the reason,
+# instead of waiting for RCON to stop answering. docker-compose mounts the log
+# directory read-only - mount the directory, never the file, or log rotation
+# strands the reader on the old inode.
+log_path      = "/app/serverlogs/atm10/latest.log"
 # webhook_url = "${ATM10_WEBHOOK_URL}"      # only if the bot lacks MANAGE_WEBHOOKS
 # icon_url    = "https://example.com/atm10.png"   # overrides [defaults].icon_url
 
@@ -47,6 +53,7 @@ rcon_host     = "70aeb1c6-a11a-4ad9-90bc-bc3590e0f0d0"
 rcon_port     = 25575
 rcon_password = "${DECEASEDCRAFT_RCON_PASSWORD}"
 database_url  = "${DECEASEDCRAFT_DATABASE_URL}"
+log_path      = "/app/serverlogs/dc/latest.log"
 # These two are tuned as a pair against the server's boot time - fixing only one
 # gets you half the story.
 #

@@ -623,8 +623,9 @@ class TestServerStatusDetection:
 
     @pytest.mark.asyncio
     async def test_server_comes_online(self, bridge):
-        """Test detection when server comes online."""
+        """Coming back after an observed outage is announced."""
         bridge.server_online = False
+        bridge._status_known = True  # the bot already saw it go down
         stats = {"tps": 20.0, "playerCount": 0, "messages": []}
 
         with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock, return_value=stats):
@@ -635,6 +636,49 @@ class TestServerStatusDetection:
         mock_embed.assert_called_once()
         # author_name is the 4th argument (index 3)
         assert "online" in mock_embed.call_args[0][3].lower()
+
+    @pytest.mark.asyncio
+    async def test_bot_restart_does_not_claim_the_server_came_online(self, bridge):
+        """Restarting the bot must not announce a server that never moved.
+
+        The bot starts assuming offline, so its first successful poll looks
+        like a transition. It is not - only the bot restarted, and saying
+        "is now online" for a server that was up the whole time is misleading.
+        """
+        stats = {"tps": 20.0, "playerCount": 3}
+        assert bridge._status_known is False
+
+        with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock, return_value=stats):
+            with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as mock_embed:
+                await bridge.poll_server_stats()   # first look after startup
+                await bridge.poll_server_stats()   # still up
+
+        assert bridge.server_online is True
+        assert bridge._status_known is True
+        mock_embed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_outage_after_startup_is_still_announced(self, bridge):
+        """Adopting state at startup must not mute later real transitions."""
+        stats = {"tps": 20.0, "playerCount": 0}
+        clock = [1000.0]
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as mock_embed:
+                with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock,
+                                  return_value=stats):
+                    await bridge.poll_server_stats()      # adopt: up, silent
+                assert mock_embed.call_count == 0
+
+                with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock,
+                                  return_value=None):
+                    await bridge.poll_server_stats()
+                    clock[0] += bridge.OFFLINE_AFTER_SECONDS
+                    await bridge.poll_server_stats()      # genuine outage
+
+        assert bridge.server_online is False
+        mock_embed.assert_called_once()
+        assert "restarting" in mock_embed.call_args[0][3].lower()
 
     @pytest.mark.asyncio
     async def test_server_goes_offline(self, bridge):
@@ -699,6 +743,50 @@ class TestServerStatusDetection:
 
         assert bridge.server_online is True
         mock_embed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refused_port_is_called_offline_quickly(self, bridge):
+        """A refused port means the process is gone, so do not wait the full window.
+
+        ECONNREFUSED is unambiguous - nothing is listening - unlike a timeout,
+        which can just be a struggling server that recovers.
+        """
+        bridge.server_online = True
+        bridge._rcon_refused = True
+        clock = [1000.0]
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock, return_value=None):
+                with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as mock_embed:
+                    await bridge.poll_server_stats()
+                    clock[0] += bridge.OFFLINE_REFUSED_AFTER_SECONDS
+                    await bridge.poll_server_stats()
+
+        assert bridge.OFFLINE_REFUSED_AFTER_SECONDS < bridge.OFFLINE_AFTER_SECONDS
+        assert bridge.server_online is False
+        mock_embed.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_timeout_still_waits_the_full_window(self, bridge):
+        """A hung server may recover, so a timeout keeps the patient window."""
+        bridge.server_online = True
+        bridge._rcon_refused = False
+        clock = [1000.0]
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock, return_value=None):
+                with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as mock_embed:
+                    await bridge.poll_server_stats()
+                    clock[0] += bridge.OFFLINE_REFUSED_AFTER_SECONDS
+                    await bridge.poll_server_stats()
+                    # past the refused window but not the ambiguous one
+                    assert bridge.server_online is True
+                    mock_embed.assert_not_called()
+                    clock[0] += bridge.OFFLINE_AFTER_SECONDS
+                    await bridge.poll_server_stats()
+
+        assert bridge.server_online is False
+        mock_embed.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_recovery_resets_the_failure_window(self, bridge):
@@ -1245,3 +1333,124 @@ class TestServerCommands:
         kwargs = interaction.response.send_message.call_args.kwargs
         assert kwargs["ephemeral"] is True
         assert "<#1>" in kwargs["embed"].description
+
+
+class TestServerLogWatch:
+    """Watching the server's own log for crash markers."""
+
+    @pytest.fixture
+    def log_bridge(self, mock_bot, tmp_path):
+        cfg = make_server_config()
+        log = tmp_path / "latest.log"
+        log.write_text("[00:00:00] [Server thread/INFO]: existing history\n")
+        cfg.minecraft.log_path = str(log)
+        bridge = stub_db(MinecraftBridge(mock_bot, cfg))
+        bridge.server_online = True
+        return bridge, log
+
+    @pytest.mark.asyncio
+    async def test_first_read_skips_existing_history(self, log_bridge):
+        """A bot restart must not replay an old crash from earlier in the file."""
+        bridge, log = log_bridge
+        log.write_text("[00:00:00] Preparing crash report\n")
+
+        with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
+            await bridge.watch_server_log()
+
+        embed.assert_not_called()
+        assert bridge.server_online is True
+
+    @pytest.mark.asyncio
+    async def test_detects_out_of_memory(self, log_bridge):
+        bridge, log = log_bridge
+        with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
+            await bridge.watch_server_log()          # prime at EOF
+            with open(log, "a") as f:
+                f.write("[15:38:14] [Server thread/ERROR]: java.lang.OutOfMemoryError: Java heap space\n")
+            await bridge.watch_server_log()
+
+        assert bridge.server_online is False
+        embed.assert_called_once()
+        assert "memory" in embed.call_args[0][3].lower()
+
+    @pytest.mark.asyncio
+    async def test_detects_watchdog_hang(self, log_bridge):
+        bridge, log = log_bridge
+        with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("[15:41:16] ServerHangWatchdog detected that a single server tick took...\n")
+            await bridge.watch_server_log()
+
+        assert "watchdog" in embed.call_args[0][3].lower()
+
+    @pytest.mark.asyncio
+    async def test_announces_once_per_incident(self, log_bridge):
+        """A crash writes many matching lines; the channel gets one message."""
+        bridge, log = log_bridge
+        with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("java.lang.OutOfMemoryError: Java heap space\n")
+                f.write("Preparing crash report\n")
+                f.write("This crash report has been saved to: /x\n")
+            await bridge.watch_server_log()
+            await bridge.watch_server_log()
+
+        embed.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_rotation_is_followed(self, log_bridge):
+        """latest.log is replaced on each boot - keep reading the new file.
+
+        This is why the deployment mounts the log *directory*: a single-file
+        bind mount pins the inode and would strand the reader on the old file.
+        """
+        bridge, log = log_bridge
+        with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("padding so the offset is well past zero\n" * 20)
+            await bridge.watch_server_log()
+
+            log.unlink()                                    # server restarts
+            log.write_text("Preparing crash report\n")      # new, much shorter file
+            await bridge.watch_server_log()
+
+        embed.assert_called_once()
+        assert "crash" in embed.call_args[0][3].lower()
+
+    @pytest.mark.asyncio
+    async def test_missing_log_file_is_harmless(self, log_bridge):
+        bridge, log = log_bridge
+        log.unlink()
+        with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
+            await bridge.watch_server_log()
+            await bridge.watch_server_log()
+        embed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disabled_when_no_log_path(self, bridge):
+        """Servers without log_path keep working, just without this signal."""
+        assert bridge.log_path == ""
+        with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
+            await bridge.watch_server_log()
+        embed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_recovery_clears_the_latch(self, log_bridge):
+        """Once the server answers again, a later crash can be announced."""
+        bridge, log = log_bridge
+        with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("java.lang.OutOfMemoryError: Java heap space\n")
+            await bridge.watch_server_log()
+        assert bridge._crash_announced is True
+
+        with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock,
+                          return_value={"tps": 20.0, "playerCount": 0}):
+            with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
+                await bridge.poll_server_stats()
+
+        assert bridge._crash_announced is False

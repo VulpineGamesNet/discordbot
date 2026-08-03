@@ -31,6 +31,13 @@ class MinecraftConfig:
     rcon_port: int
     rcon_password: str
     server_name: str = "Minecraft Server"
+    # Optional path to the server's latest.log, as seen from inside this
+    # container. When set, the bot watches it for crash markers, which surface
+    # a crash the moment it is written rather than waiting for RCON to fail -
+    # and carry the reason with them. Mount the log *directory*, not the file:
+    # a single-file bind mount pins the inode, so the container would keep
+    # reading the pre-rotation file forever.
+    log_path: str = ""
 
 
 @dataclass
@@ -135,6 +142,7 @@ def _server(raw: dict, defaults: dict) -> ServerConfig:
             rcon_port=int(raw.get("rcon_port", 25575)),
             rcon_password=_require(raw, "rcon_password", name),
             server_name=name,
+            log_path=raw.get("log_path", ""),
         ),
         database=DatabaseConfig(url=_require(raw, "database_url", name)),
         settings=settings,

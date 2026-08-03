@@ -6,14 +6,23 @@ services:
     stop_grace_period: 15s
     env_file:
       - .env
-    # Non-root. No host volumes are mounted, so this uid only needs to read
-    # config.toml - keep that file world-readable (it holds no secrets, only
-    # ${VAR} placeholders resolved from .env by the process itself).
+    # Non-root, and matching the Pterodactyl uid so the read-only log mounts
+    # below are readable. config.toml holds no secrets, only ${VAR}
+    # placeholders the process resolves from .env itself.
     user: "997:988"
     volumes:
       # Mounted, not baked into the image: adding or editing a server is a
       # restart, not a rebuild.
       - ./config.toml:/app/config.toml:ro
+      # Server logs, read-only, for crash detection. A crash appears here the
+      # moment it happens and says why, where RCON only reveals it once the
+      # server stops answering - minutes later during an out-of-memory death.
+      #
+      # Mount the DIRECTORY, never latest.log itself: a single-file bind mount
+      # pins the inode, so after the server rotates the log on restart the
+      # container would keep reading the old, frozen file forever.
+      - /var/lib/pterodactyl/volumes/284c8202-2eb5-4ba2-b7b9-519145422945/logs:/app/serverlogs/atm10:ro
+      - /var/lib/pterodactyl/volumes/70aeb1c6-a11a-4ad9-90bc-bc3590e0f0d0/logs:/app/serverlogs/dc:ro
     networks:
       - pterodactyl_nw
 
