@@ -3,6 +3,9 @@
 # Structural config lives here. Secrets come from the environment (or .env)
 # through ${VAR} placeholders - a missing ${VAR} is a hard startup error.
 # To write a literal "$" in a value, escape it as "$$".
+#
+# Values below mirror the live Vulpine deployment, with channel ids replaced by
+# placeholders. Everything here is safe to commit; nothing is a secret.
 
 [discord]
 token = "${DISCORD_TOKEN}"
@@ -21,10 +24,16 @@ icon_url = "https://raw.githubusercontent.com/VulpineGamesNet/discordbot/main/re
 
 # One block per Minecraft server. Each needs its own Discord channel and its
 # own MySQL database - the discord_events table is not shared between servers.
+#
+# `name` is the display name: embeds, webhook username, presence and log prefix.
+# It should match `server_name` in that server's kubejs/config/discord.json.
+#
+# `rcon_host` is resolved by Docker DNS on the shared network. Under Pterodactyl
+# the container is named after the server UUID, so that UUID is the hostname.
 [[servers]]
-name          = "ATM10"                     # shown in embeds, webhook name, presence, log prefix
+name          = "Vulpine ATM10"
 channel_id    = 111111111111111111
-rcon_host     = "atm10"
+rcon_host     = "284c8202-2eb5-4ba2-b7b9-519145422945"
 rcon_port     = 25575
 rcon_password = "${ATM10_RCON_PASSWORD}"
 database_url  = "${ATM10_DATABASE_URL}"     # jdbc:mysql:// and mysql:// both accepted
@@ -32,10 +41,15 @@ database_url  = "${ATM10_DATABASE_URL}"     # jdbc:mysql:// and mysql:// both ac
 # icon_url    = "https://example.com/atm10.png"   # overrides [defaults].icon_url
 
 [[servers]]
-name              = "DeceasedCraft"
-channel_id        = 222222222222222222
-rcon_host         = "deceasedcraft"
-rcon_port         = 25575
-rcon_password     = "${DECEASEDCRAFT_RCON_PASSWORD}"
-database_url      = "${DECEASEDCRAFT_DATABASE_URL}"
-offline_threshold = 20                      # per-server override: slower restarts
+name          = "Vulpine DC"
+channel_id    = 222222222222222222
+rcon_host     = "70aeb1c6-a11a-4ad9-90bc-bc3590e0f0d0"
+rcon_port     = 25575
+rcon_password = "${DECEASEDCRAFT_RCON_PASSWORD}"
+database_url  = "${DECEASEDCRAFT_DATABASE_URL}"
+# Tune this to the server's boot time. The bot only announces a restart once it
+# has seen offline_threshold consecutive failures, so a server that comes back
+# faster than that window is never reported as down at all. This one boots in
+# ~20s, so the default 12 (60s) stayed silent; 4 (20s) catches it while still
+# ignoring a single dropped RCON packet.
+offline_threshold = 4
