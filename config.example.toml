@@ -47,9 +47,18 @@ rcon_host     = "70aeb1c6-a11a-4ad9-90bc-bc3590e0f0d0"
 rcon_port     = 25575
 rcon_password = "${DECEASEDCRAFT_RCON_PASSWORD}"
 database_url  = "${DECEASEDCRAFT_DATABASE_URL}"
-# Tune this to the server's boot time. The bot only announces a restart once it
-# has seen offline_threshold consecutive failures, so a server that comes back
-# faster than that window is never reported as down at all. This one boots in
-# ~20s, so the default 12 (60s) stayed silent; 4 (20s) catches it while still
-# ignoring a single dropped RCON packet.
+# These two are tuned as a pair against the server's boot time - fixing only one
+# gets you half the story.
+#
+# offline_threshold decides whether the server going down is noticed at all: the
+# bot announces a restart only after this many consecutive failed checks, so a
+# server back on its feet sooner than that window is never reported as down. DC
+# boots in ~20s, so the default 12 (60s) stayed silent; 4 (20s) catches it while
+# still ignoring a single dropped RCON packet.
+#
+# status_cooldown then decides whether the "back online" embed is allowed to
+# follow. The "restarting" embed starts the cooldown, so with the default 30 the
+# recovery 20s later was dropped and the channel was left claiming the server was
+# still down. 10 lets both post.
 offline_threshold = 4
+status_cooldown   = 10
