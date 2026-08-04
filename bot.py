@@ -136,6 +136,8 @@ class MinecraftBridge(commands.Cog):
         self._log_down_at: float = 0.0
         # Database manager for Discord events
         self.db_manager: DatabaseManager = DatabaseManager(config.database, server_name)
+        # name (lowercased) -> (member id or None, when the answer expires)
+        self._mention_cache: dict[str, tuple[Optional[int], float]] = {}
 
     async def cog_load(self) -> None:
         """Called when cog is loaded."""
@@ -342,6 +344,11 @@ class MinecraftBridge(commands.Cog):
         player_uuid: Optional[str] = None,
     ) -> bool:
         """Send a message via Discord webhook."""
+        # Chat carries "@name" pings resolved by resolve_mentions, so user
+        # mentions must parse - but a webhook may ping @everyone and every role
+        # by default, and nobody in game gets to do that.
+        allowed = discord.AllowedMentions(everyone=False, roles=False, users=True)
+
         # Use managed webhook if available
         if self.managed_webhook:
             try:
@@ -350,6 +357,7 @@ class MinecraftBridge(commands.Cog):
                     content=content,
                     username=player_name or self.config.minecraft.server_name,
                     avatar_url=avatar_url,
+                    allowed_mentions=allowed,
                 )
                 return True
             except discord.HTTPException as e:
@@ -368,6 +376,7 @@ class MinecraftBridge(commands.Cog):
         payload = {
             "content": content,
             "avatar_url": avatar_url,
+            "allowed_mentions": {"parse": ["users"]},
         }
         if player_name:
             payload["username"] = player_name
@@ -517,6 +526,53 @@ class MinecraftBridge(commands.Cog):
 
         return buffer
 
+    # "@name" typed in game. Dots are allowed inside a Discord username but not
+    # at the end, so "@fox." looks up "fox" and keeps the full stop.
+    MENTION_RE = re.compile(r"@([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)")
+    MENTION_CACHE_TTL: float = 600.0  # also how long a rename stays wrong
+    MENTION_MAX_PER_MESSAGE = 5  # cap the gateway lookups one message can cost
+
+    async def _lookup_member_id(self, name: str) -> Optional[int]:
+        """Find the Discord member behind a name, cached for MENTION_CACHE_TTL."""
+        key = name.lower()
+        cached = self._mention_cache.get(key)
+        if cached and cached[1] > time.monotonic():
+            return cached[0]
+
+        channel = self.bot.get_channel(self.config.discord.channel_id)
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return None
+
+        try:
+            # Gateway member query. A non-empty query needs no privileged
+            # members intent, unlike fetching the whole member list.
+            members = await guild.query_members(query=name, limit=10)
+        except (discord.HTTPException, asyncio.TimeoutError) as e:
+            # Not cached: a transient failure must not stick for ten minutes.
+            self.log.debug(f"Member lookup for @{name} failed: {e}")
+            return None
+
+        member = discord.utils.find(
+            lambda m: key in (m.name.lower(), m.display_name.lower()), members
+        )
+        member_id = member.id if member else None
+        self._mention_cache[key] = (member_id, time.monotonic() + self.MENTION_CACHE_TTL)
+        return member_id
+
+    async def resolve_mentions(self, content: str) -> str:
+        """Turn "@name" from in-game chat into a real Discord ping."""
+        if "@" not in content:
+            return content
+
+        names = {m.group(1) for m in self.MENTION_RE.finditer(content)}
+        # Longest first: replacing "@fox" before "@foxtrot" would maul the latter.
+        for name in sorted(names, key=len, reverse=True)[: self.MENTION_MAX_PER_MESSAGE]:
+            member_id = await self._lookup_member_id(name)
+            if member_id:
+                content = content.replace(f"@{name}", f"<@{member_id}>")
+        return content
+
     async def process_events(self, events: list[DiscordEvent]) -> None:
         """Process events from database (chat, join, leave)."""
         for event in events:
@@ -525,7 +581,7 @@ class MinecraftBridge(commands.Cog):
             uuid = event.player_uuid
 
             if msg_type == "chat":
-                content = event.message or ""
+                content = await self.resolve_mentions(event.message or "")
                 await self.send_webhook_message(content, player, uuid)
                 self.log.info(f"Relayed chat from {player}: {content[:50]}...")
 

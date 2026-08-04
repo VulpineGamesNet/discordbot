@@ -26,6 +26,7 @@ halves live in this repo so they version together.
 
 Per server:
 - Chat relay both directions, with player skin avatars on the Discord side
+- `@name` typed in game pings that Discord member (`@everyone` and roles never ping)
 - Join / leave embeds
 - Channel topic showing TPS, player count and uptime
 - Server online / restarting notifications (with debounce so a restart isn't spammy)

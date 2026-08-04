@@ -444,6 +444,79 @@ class TestPersistentRCON:
         assert bridge.poll_server_stats.seconds == 10
 
 
+class TestInGameMentions:
+    """Tests for turning in-game "@name" into a Discord ping."""
+
+    @pytest.fixture
+    def guild_bridge(self, bridge):
+        """Give the bridge a channel whose guild answers member queries."""
+        def member(name, display_name, member_id):
+            m = MagicMock()
+            m.name = name
+            m.display_name = display_name
+            m.id = member_id
+            return m
+
+        guild = MagicMock()
+        guild.query_members = AsyncMock(
+            side_effect=lambda query, limit: {
+                "Fox": [member("fox", "Fox", 111)],
+                "foxtrot": [member("foxtrot", "Foxtrot", 222)],
+                "Vulpine": [member("someone", "Vulpine", 333)],
+            }.get(query, [])
+        )
+        channel = MagicMock()
+        channel.guild = guild
+        bridge.bot.get_channel = MagicMock(return_value=channel)
+        return bridge
+
+    @pytest.mark.asyncio
+    async def test_mention_resolves_to_ping(self, guild_bridge):
+        assert await guild_bridge.resolve_mentions("hey @Fox") == "hey <@111>"
+
+    @pytest.mark.asyncio
+    async def test_mention_matches_display_name(self, guild_bridge):
+        assert await guild_bridge.resolve_mentions("@Vulpine hi") == "<@333> hi"
+
+    @pytest.mark.asyncio
+    async def test_unknown_name_left_alone(self, guild_bridge):
+        assert await guild_bridge.resolve_mentions("@nobody hi") == "@nobody hi"
+
+    @pytest.mark.asyncio
+    async def test_prefix_name_does_not_maul_longer_one(self, guild_bridge):
+        assert (
+            await guild_bridge.resolve_mentions("@Fox and @foxtrot")
+            == "<@111> and <@222>"
+        )
+
+    @pytest.mark.asyncio
+    async def test_trailing_dot_is_not_part_of_the_name(self, guild_bridge):
+        assert await guild_bridge.resolve_mentions("bye @Fox.") == "bye <@111>."
+
+    @pytest.mark.asyncio
+    async def test_lookup_is_cached(self, guild_bridge):
+        await guild_bridge.resolve_mentions("@Fox")
+        await guild_bridge.resolve_mentions("@fox")
+        assert guild_bridge.bot.get_channel.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_plain_message_never_hits_the_gateway(self, guild_bridge):
+        assert await guild_bridge.resolve_mentions("no pings here") == "no pings here"
+        guild_bridge.bot.get_channel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_everyone_is_not_pingable_from_game(self, bridge):
+        bridge.managed_webhook = MagicMock()
+        bridge.managed_webhook.send = AsyncMock()
+
+        await bridge.send_webhook_message("@everyone look at this", "Steve", "uuid")
+
+        allowed = bridge.managed_webhook.send.call_args.kwargs["allowed_mentions"]
+        assert allowed.everyone is False
+        assert allowed.roles is False
+        assert allowed.users is True
+
+
 class TestMessageHandler:
     """Tests for Discord message handling."""
 
