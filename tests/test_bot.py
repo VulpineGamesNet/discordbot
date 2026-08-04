@@ -789,6 +789,59 @@ class TestServerStatusDetection:
         mock_embed.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_recovery_is_posted_even_inside_the_cooldown(self, bridge):
+        """An announced outage must always get its all-clear.
+
+        Cooldown exists to throttle repeated alerts. Applying it to the
+        recovery leaves the channel claiming the server is still down: on
+        2026-08-04 ATM10 froze three times, every "restarting" was posted and
+        every recovery was swallowed, twice within seconds of the alert.
+        """
+        bridge.server_online = True
+        bridge._status_known = True
+        clock = [1000.0]
+        stats = {"tps": 20.0, "playerCount": 0}
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
+                with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock,
+                                  return_value=None):
+                    await bridge.poll_server_stats()
+                    clock[0] += bridge.OFFLINE_AFTER_SECONDS
+                    await bridge.poll_server_stats()          # outage announced
+                assert bridge._offline_announced is True
+                assert embed.call_count == 1
+
+                # Recovers immediately, far inside STATUS_COOLDOWN
+                with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock,
+                                  return_value=stats):
+                    await bridge.poll_server_stats()
+
+        assert bridge.server_online is True
+        assert bridge._offline_announced is False
+        assert embed.call_count == 2
+        assert "online" in embed.call_args[0][3].lower()
+
+    @pytest.mark.asyncio
+    async def test_unannounced_recovery_still_respects_cooldown(self, bridge):
+        """Without an outstanding alert the cooldown still applies, so a
+        flapping server cannot spam the channel."""
+        bridge.server_online = False
+        bridge._status_known = True
+        bridge._offline_announced = False
+        clock = [1000.0]
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            bridge.last_status_notification = clock[0]      # something posted just now
+            with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock,
+                              return_value={"tps": 20.0, "playerCount": 0}):
+                with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
+                    await bridge.poll_server_stats()
+
+        assert bridge.server_online is True
+        embed.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_recovery_resets_the_failure_window(self, bridge):
         """A server that answers again restarts the clock, so old failures
         cannot accumulate across separate incidents."""
@@ -1379,7 +1432,8 @@ class TestServerLogWatch:
         with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
             await bridge.watch_server_log()
             with open(log, "a") as f:
-                f.write("[15:41:16] ServerHangWatchdog detected that a single server tick took...\n")
+                f.write("[06:08:12] [Server Watchdog/FATAL] [net.minecraft.server.dedicated."
+                        "ServerWatchdog/]: A single server tick took 60.00 seconds\n")
             await bridge.watch_server_log()
 
         assert "watchdog" in embed.call_args[0][3].lower()
@@ -1439,18 +1493,72 @@ class TestServerLogWatch:
 
     @pytest.mark.asyncio
     async def test_recovery_clears_the_latch(self, log_bridge):
-        """Once the server answers again, a later crash can be announced."""
+        """Once the server has gone and come back, a later crash can be announced."""
         bridge, log = log_bridge
+        await self._announce_crash(bridge, log)
+        assert bridge._crash_announced is True
+
         with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
+            await self._poll(bridge, None)                              # the port drops
+            assert bridge._down_confirmed is True
+            await self._poll(bridge, {"tps": 20.0, "playerCount": 0})   # back up
+
+        assert bridge._crash_announced is False
+        assert bridge._down_confirmed is False
+        assert bridge.server_online is True
+
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_flip_back_online(self, log_bridge):
+        """RCON answers all the way through a save, and must not read as a recovery.
+
+        "Stopping server" is written when the shutdown starts, but the RCON
+        thread lives until the save finishes - seconds later on DeceasedCraft,
+        longer on ATM10. A poll landing in that gap used to post "is now
+        online!" in the middle of the outage, then "is restarting..." again
+        once the port finally dropped.
+        """
+        bridge, log = log_bridge
+        with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
             await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("[12:47:17] [Server thread/INFO] "
+                        "[net.minecraft.server.MinecraftServer/]: Stopping server\n")
+            await bridge.watch_server_log()
+            assert embed.call_count == 1
+            assert "stopping" in embed.call_args[0][3].lower()
+
+            for _ in range(3):                                # still saving
+                await self._poll(bridge, {"tps": 20.0, "playerCount": 0})
+
+        assert bridge.server_online is False
+        assert embed.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_survivable_warning_clears_after_the_grace(self, log_bridge):
+        """A log line the server survives must not wedge the bridge offline."""
+        bridge, log = log_bridge
+        await self._announce_crash(bridge, log)
+
+        with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
+            with patch("bot.time.time",
+                       return_value=bridge._log_down_at + bridge.LOG_DOWN_GRACE + 1):
+                await self._poll(bridge, {"tps": 20.0, "playerCount": 0})
+
+        assert bridge.server_online is True
+        assert bridge._crash_announced is False
+        embed.assert_called_once()
+        assert "online" in embed.call_args[0][3].lower()
+
+    @staticmethod
+    async def _announce_crash(bridge, log):
+        with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
+            await bridge.watch_server_log()                   # prime at EOF
             with open(log, "a") as f:
                 f.write("java.lang.OutOfMemoryError: Java heap space\n")
             await bridge.watch_server_log()
-        assert bridge._crash_announced is True
 
+    @staticmethod
+    async def _poll(bridge, stats):
         with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock,
-                          return_value={"tps": 20.0, "playerCount": 0}):
-            with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
-                await bridge.poll_server_stats()
-
-        assert bridge._crash_announced is False
+                          return_value=stats):
+            await bridge.poll_server_stats()

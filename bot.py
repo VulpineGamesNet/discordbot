@@ -109,6 +109,12 @@ class MinecraftBridge(commands.Cog):
         # poll looks like a transition and announces "is now online" for a
         # server that never went anywhere - only the bot restarted.
         self._status_known: bool = False
+        # True once an outage has been announced and not yet resolved. A
+        # recovery that answers an announced outage always gets posted, even
+        # inside the cooldown: throttling repeat alerts is worth doing,
+        # silently withholding the all-clear is not - it leaves the channel
+        # claiming the server is still down.
+        self._offline_announced: bool = False
         # Persistent RCON connection state
         self._rcon_socket: Optional[socket.socket] = None
         self._rcon_connected: bool = False
@@ -122,6 +128,12 @@ class MinecraftBridge(commands.Cog):
         # Set once a crash marker has been announced, cleared when the server
         # answers again, so one incident produces one message.
         self._crash_announced: bool = False
+        # RCON survives the start of a shutdown - the server keeps answering
+        # while it saves. Until a poll has actually failed, a success after a
+        # log warning means "still going down", not "back up", and must not be
+        # allowed to post an "is now online" in the middle of the outage.
+        self._down_confirmed: bool = False
+        self._log_down_at: float = 0.0
         # Database manager for Discord events
         self.db_manager: DatabaseManager = DatabaseManager(config.database, server_name)
 
@@ -579,10 +591,24 @@ class MinecraftBridge(commands.Cog):
         now = time.time()
 
         if stats:
+            # A server that is shutting down answers RCON until the save
+            # finishes, so a success here does not undo a log warning until a
+            # poll has actually failed. Without the grace cap a log line that
+            # turns out to be survivable would wedge the bridge as offline.
+            if self._crash_announced and not self._down_confirmed:
+                if now - self._log_down_at < self.LOG_DOWN_GRACE:
+                    self.log.debug("RCON still answering after the log said the server is going down")
+                    return
+                self.log.info(
+                    "Server still answering %.0fs after the log warning - treating it as survived",
+                    now - self._log_down_at,
+                )
+
             self.last_stats = stats
             self.consecutive_offline_checks = 0  # Reset offline counter
             self.first_failed_check = None
             self._crash_announced = False
+            self._down_confirmed = False
 
             if not self.server_online:
                 self.server_online = True
@@ -592,8 +618,10 @@ class MinecraftBridge(commands.Cog):
                     # happen are worth reporting.
                     self._status_known = True
                     self.log.info("Server already up at startup - no notification")
-                # Only notify if cooldown has passed
-                elif now - self.last_status_notification >= self.STATUS_COOLDOWN:
+                elif (
+                    self._offline_announced
+                    or now - self.last_status_notification >= self.STATUS_COOLDOWN
+                ):
                     server_name = self.config.minecraft.server_name
                     await self._send_status_embed_with_retry(
                         self.EMBED_COLOR_BLUE,
@@ -601,11 +629,13 @@ class MinecraftBridge(commands.Cog):
                         log_label="Server came online",
                     )
                     self.last_status_notification = now
+                    self._offline_announced = False
                 else:
                     self.log.info("Server came online - notification skipped (cooldown)")
         else:
             self.consecutive_offline_checks += 1
             self._status_known = True
+            self._down_confirmed = True
             if self.first_failed_check is None:
                 self.first_failed_check = now
             unreachable_for = now - self.first_failed_check
@@ -630,6 +660,7 @@ class MinecraftBridge(commands.Cog):
                         log_label="Server went offline",
                     )
                     self.last_status_notification = now
+                    self._offline_announced = True
                 else:
                     self.log.info("Server went offline - notification skipped (cooldown)")
 
@@ -685,13 +716,20 @@ class MinecraftBridge(commands.Cog):
 
     # Lines that mean the server is dying or gone. Ordered most specific
     # first; the first match wins, so a crash report beats a plain stop.
+    # Strings checked against the live logs of both packs, not guessed: the
+    # watchdog class is ServerWatchdog on 1.20.1 and 1.21.1 alike (the old
+    # ServerHangWatchdog name went away with the MCP mappings), and vanilla
+    # logs "Stopping server", never "Stopping the server".
     LOG_CRASH_MARKERS = (
         ("OutOfMemoryError", "ran out of memory"),
-        ("ServerHangWatchdog", "stopped responding (watchdog)"),
+        ("ServerWatchdog", "stopped responding (watchdog)"),
         ("Preparing crash report", "crashed"),
         ("This crash report has been saved", "crashed"),
-        ("Stopping the server", "is stopping"),
+        ("Stopping server", "is stopping"),
     )
+    # How long RCON may keep answering after a log warning before the warning
+    # is judged wrong. Longer than any save; shorter than a restart.
+    LOG_DOWN_GRACE: float = 60.0
     # Only inspect the tail of a burst; a crashing server can emit a very
     # large report and none of it changes the verdict.
     LOG_MAX_LINES_PER_TICK = 400
@@ -756,6 +794,11 @@ class MinecraftBridge(commands.Cog):
     async def _announce_from_log(self, reason: str, line: str) -> None:
         """Post a crash notice found in the log and suppress the RCON one."""
         self._crash_announced = True
+        self._down_confirmed = False
+        self._log_down_at = time.time()
+        # The log is as good a source of state as a poll, so the recovery that
+        # follows counts as a transition rather than a startup observation.
+        self._status_known = True
         server_name = self.config.minecraft.server_name
         self.log.warning("Server log reports it %s: %s", reason, line.strip()[:200])
 
@@ -772,6 +815,7 @@ class MinecraftBridge(commands.Cog):
             log_label="Crash detected in server log",
         )
         self.last_status_notification = time.time()
+        self._offline_announced = True
 
     @watch_server_log.before_loop
     async def before_watch_log(self) -> None:
