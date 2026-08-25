@@ -12,6 +12,11 @@ token = "${DISCORD_TOKEN}"
 # Optional. With a guild id, slash commands appear instantly in that server.
 # Omit it for a global sync (can take up to an hour to propagate).
 guild_id = 123456789012345678
+# Optional. Discord user DMed when a server stays offline past
+# down_alert_after. Right-click your name with Developer Mode on to copy the id.
+# The bot can only DM someone who shares a server with it. Omit it and the
+# alert is only written to the log.
+alert_user_id = 123456789012345678
 
 # Applied to every [[servers]] block. Any key here may be overridden per server.
 [defaults]
@@ -20,6 +25,7 @@ events_poll_interval = 2     # discord_events DB poll, seconds
 max_message_length   = 256   # truncation before relaying to Minecraft
 offline_threshold    = 12    # consecutive failed stat checks before "restarting..."
 status_cooldown      = 30    # min seconds between online/offline embeds
+down_alert_after     = 300   # seconds offline before the owner is DMed
 icon_url = "https://raw.githubusercontent.com/VulpineGamesNet/discordbot/main/resources/vulpines.png"
 
 # One block per Minecraft server. Each needs its own Discord channel and its
@@ -63,5 +69,11 @@ log_path      = "/app/serverlogs/dc/latest.log"
 # status_cooldown only throttles repeated *alerts*. The all-clear that resolves
 # an announced outage is never withheld, whatever this is set to - a suppressed
 # recovery leaves the channel claiming the server is still down.
+#
+# down_alert_after is a different kind of number: not "is it down" but "is it
+# staying down". Wings restarts a crashed server on its own in about three
+# minutes, so the DM is only worth sending once that has visibly failed. It is
+# counted from the offline mark, not from the first failed check, so slow
+# detection on a wedged server does not eat the grace period.
 offline_threshold = 4
 status_cooldown   = 10

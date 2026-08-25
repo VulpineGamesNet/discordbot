@@ -91,6 +91,11 @@ class MinecraftBridge(commands.Cog):
         # port, so the process is gone rather than merely slow. That needs no
         # patience, unlike a timeout which may just be a struggling server.
         self.OFFLINE_REFUSED_AFTER_SECONDS: float = 2 * config.settings.stats_check_interval
+        # Grace period between "offline" and DMing the owner. Wings restarts a
+        # crashed server by itself in about three minutes, so the alert is for
+        # outages that survive the automatic recovery - it is measured from the
+        # moment the server is marked offline, not from the first failed check.
+        self.DOWN_ALERT_AFTER_SECONDS: float = config.settings.down_alert_after
         self.last_stats: Optional[dict] = None
         self.rcon_lock = asyncio.Lock()
         self.last_topic: Optional[str] = None
@@ -115,6 +120,15 @@ class MinecraftBridge(commands.Cog):
         # silently withholding the all-clear is not - it leaves the channel
         # claiming the server is still down.
         self._offline_announced: bool = False
+        # When the server was marked offline, None while it is up. The alert
+        # grace period is measured from here rather than from
+        # first_failed_check, so it is a wait for the automatic restart to fail
+        # and does not shrink when detection itself was slow.
+        self._offline_since: Optional[float] = None
+        # True once the owner has been DMed about the current outage. One DM per
+        # outage, plus an all-clear when it ends - a ping with no resolution
+        # means checking by hand anyway.
+        self._down_alert_sent: bool = False
         # Persistent RCON connection state
         self._rcon_socket: Optional[socket.socket] = None
         self._rcon_connected: bool = False
@@ -665,6 +679,18 @@ class MinecraftBridge(commands.Cog):
             self.first_failed_check = None
             self._crash_announced = False
             self._down_confirmed = False
+            offline_since = self._offline_since
+            self._offline_since = None
+
+            # Only worth a DM if one was already sent: a server that came back
+            # inside the grace period was never escalated to a human.
+            if self._down_alert_sent:
+                self._down_alert_sent = False
+                offline_for = now - offline_since if offline_since else 0.0
+                await self._send_down_alert_dm(
+                    f"\u2705 **{self.config.minecraft.server_name}** is back up "
+                    f"after {self._format_duration(offline_for)} offline."
+                )
 
             if not self.server_online:
                 self.server_online = True
@@ -705,6 +731,25 @@ class MinecraftBridge(commands.Cog):
                 if self._rcon_refused
                 else self.OFFLINE_AFTER_SECONDS
             )
+            # Stamped independently of the transition below, which only
+            # fires when the bridge saw the server up first. A bot restarted
+            # during an outage never sees that transition, and it still has to
+            # be able to escalate.
+            if self._offline_since is None and unreachable_for >= window:
+                self._offline_since = now
+
+            if (
+                not self._down_alert_sent
+                and self._offline_since is not None
+                and now - self._offline_since >= self.DOWN_ALERT_AFTER_SECONDS
+            ):
+                self._down_alert_sent = True
+                await self._send_down_alert_dm(
+                    f"\U0001f6a8 **{self.config.minecraft.server_name}** has been offline for "
+                    f"{self._format_duration(now - self._offline_since)} and has not come back "
+                    f"on its own."
+                )
+
             if self.server_online and unreachable_for >= window:
                 self.server_online = False
                 # Only notify if cooldown has passed
@@ -719,6 +764,34 @@ class MinecraftBridge(commands.Cog):
                     self._offline_announced = True
                 else:
                     self.log.info("Server went offline - notification skipped (cooldown)")
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """Render a duration as '5 minutes' / '1 hour 12 minutes'."""
+        minutes = int(seconds // 60)
+        if minutes < 60:
+            return f"{minutes} minute{'s' if minutes != 1 else ''}"
+        hours, minutes = divmod(minutes, 60)
+        text = f"{hours} hour{'s' if hours != 1 else ''}"
+        if minutes:
+            text += f" {minutes} minute{'s' if minutes != 1 else ''}"
+        return text
+
+    async def _send_down_alert_dm(self, text: str) -> None:
+        """DM the configured owner. Never raises - the poll loop must survive it."""
+        user_id = self.bot.config.alert_user_id
+        if not user_id:
+            self.log.warning("Down alert not sent - [discord].alert_user_id is not set: %s", text)
+            return
+        try:
+            user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+            await user.send(text)
+            self.log.info("Down alert DM sent to %s", user_id)
+        except Exception as e:
+            # Closed DMs and a wrong id both land here and neither is fixable at
+            # runtime, so log it and carry on watching the server rather than
+            # retrying forever or killing the poll loop.
+            self.log.error("Down alert DM to %s failed: %s", user_id, e)
 
     STATUS_RETRY_DELAY: float = 2.0  # seconds before retrying a failed status webhook
 

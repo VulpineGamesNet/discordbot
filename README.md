@@ -30,6 +30,8 @@ Per server:
 - Join / leave embeds
 - Channel topic showing TPS, player count and uptime
 - Server online / restarting notifications (with debounce so a restart isn't spammy)
+- DM to the owner when a server stays offline past `down_alert_after` (default
+  5 min) and an all-clear when it comes back - see [Down alerts](#down-alerts)
 - `/players` slash command — resolves which server from the channel it was run in
 
 If one server's RCON or database is down, the others keep working.
@@ -72,6 +74,39 @@ with an underscore.
 Reloading re-runs the KubeJS script bodies, but **does not** rebuild the command
 tree — edits to `getstats` / `discordmsg` / `discordstatus` need a full Minecraft
 server restart to take effect.
+
+## Down alerts
+
+The channel embeds (`is restarting...` / `is now online`) are for players and
+fire on every bounce. The down alert is a different audience: a DM to one
+person, sent only when an outage needs a human.
+
+```toml
+[discord]
+alert_user_id = 123456789012345678   # omit to disable
+
+[defaults]
+down_alert_after = 300               # seconds offline before the DM
+```
+
+`down_alert_after` is counted **from the moment the server is marked offline**,
+not from the first failed RCON check. That is deliberate: wings restarts a
+crashed server by itself in roughly three minutes, so the window is a wait for
+that automatic recovery to fail. Anchoring on the first failure would spend the
+grace on detection instead — a wedged server answers the TCP connect and then
+times out, so one check can cost 30s and detection lands well after the outage
+began.
+
+- Recovery inside the window: no DM at all, nobody is woken up.
+- Recovery after the DM: an all-clear DM follows, with how long it was down.
+- One DM per outage, however long it lasts.
+- A bot restarted *during* an outage still alerts — the offline mark does not
+  depend on having watched the server go down.
+
+The bot can only DM someone who shares a server with it. If the DM fails
+(closed DMs, wrong id) it is logged and the bridge keeps running; it is never
+retried, because neither cause is fixable at runtime. With no `alert_user_id`
+set, the alert is written to the log instead.
 
 ## Adding a server
 

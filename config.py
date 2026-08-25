@@ -67,6 +67,10 @@ class Settings:
     events_poll_interval: int = 2  # seconds between discord_events DB polls
     offline_threshold: int = 12  # consecutive failed stats checks before marking offline
     status_cooldown: int = 30  # seconds between online/offline status notifications
+    # Grace period after the server is marked offline before the owner is DMed.
+    # Wings restarts a crashed server on its own in about three minutes, so an
+    # outage shorter than this needs no human and is not worth a ping.
+    down_alert_after: int = 300  # seconds offline before the alert DM
 
 
 @dataclass
@@ -86,6 +90,10 @@ class BotConfig:
     token: str
     servers: list[ServerConfig]
     guild_id: Optional[int] = None
+    # Discord user DMed when a server stays offline past down_alert_after.
+    # Optional: without it the alert is only logged and everything else works
+    # unchanged.
+    alert_user_id: Optional[int] = None
 
 
 # Keys of Settings, used to split per-server tunables from connection details.
@@ -213,4 +221,5 @@ def load_config(path: str = "config.toml", env_file: Optional[str] = ".env") -> 
         token=token,
         servers=servers,
         guild_id=int(discord["guild_id"]) if discord.get("guild_id") else None,
+        alert_user_id=int(discord["alert_user_id"]) if discord.get("alert_user_id") else None,
     )

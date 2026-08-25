@@ -1635,3 +1635,203 @@ class TestServerLogWatch:
         with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock,
                           return_value=stats):
             await bridge.poll_server_stats()
+
+
+class TestDownAlertDM:
+    """The owner is DMed only when an outage outlives the automatic restart.
+
+    Wings restarts a crashed server by itself in about three minutes, so the
+    grace period runs from the moment the server is marked *offline* - not from
+    the first failed check. Anchoring it on the first failure would spend the
+    grace on detection and page for outages that were about to fix themselves.
+    """
+
+    @pytest.fixture
+    def alert_bridge(self, bridge):
+        bridge.bot.config.alert_user_id = 424242
+        bridge.bot.get_user = MagicMock(return_value=None)
+        bridge.bot.fetch_user = AsyncMock(return_value=MagicMock(send=AsyncMock()))
+        return bridge
+
+    async def _go_offline(self, bridge, clock):
+        """Drive the bridge to offline and return the moment it got there."""
+        with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock, return_value=None):
+            with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
+                while bridge.server_online:
+                    await bridge.poll_server_stats()
+                    clock[0] += bridge.config.settings.stats_check_interval
+        return bridge._offline_since
+
+    @pytest.mark.asyncio
+    async def test_dm_after_the_grace_period(self, alert_bridge):
+        """Still offline once the grace has run out - the owner gets pinged."""
+        alert_bridge.server_online = True
+        clock = [1000.0]
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            offline_at = await self._go_offline(alert_bridge, clock)
+            assert offline_at is not None
+            assert alert_bridge._down_alert_sent is False
+
+            clock[0] = offline_at + alert_bridge.DOWN_ALERT_AFTER_SECONDS
+            with patch.object(alert_bridge, "get_stats_via_rcon",
+                              new_callable=AsyncMock, return_value=None):
+                with patch.object(alert_bridge, "send_webhook_embed", new_callable=AsyncMock):
+                    await alert_bridge.poll_server_stats()
+
+        assert alert_bridge._down_alert_sent is True
+        dm = alert_bridge.bot.fetch_user.return_value.send
+        dm.assert_awaited_once()
+        assert "offline" in dm.await_args[0][0].lower()
+
+    @pytest.mark.asyncio
+    async def test_grace_is_measured_from_offline_not_first_failure(self, alert_bridge):
+        """Slow detection must not eat into the grace period.
+
+        A wedged server answers the TCP connect and then times out, so a single
+        check can cost 30s and detection lands well after the first failure.
+        The countdown starts at the offline mark, so the server still gets the
+        full window to come back on its own.
+        """
+        alert_bridge.server_online = True
+        clock = [1000.0]
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            offline_at = await self._go_offline(alert_bridge, clock)
+            # Past the grace as measured from the first failure, short of it
+            # as measured from the offline mark. Only the latter may count.
+            assert offline_at > alert_bridge.first_failed_check
+            clock[0] = offline_at + alert_bridge.DOWN_ALERT_AFTER_SECONDS - 1
+            with patch.object(alert_bridge, "get_stats_via_rcon",
+                              new_callable=AsyncMock, return_value=None):
+                with patch.object(alert_bridge, "send_webhook_embed", new_callable=AsyncMock):
+                    await alert_bridge.poll_server_stats()
+
+        assert alert_bridge._down_alert_sent is False
+        alert_bridge.bot.fetch_user.return_value.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_auto_restart_inside_the_grace_is_silent(self, alert_bridge):
+        """The whole point: wings fixed it, so nobody is woken up."""
+        alert_bridge.server_online = True
+        clock = [1000.0]
+        stats = {"tps": 20.0, "playerCount": 0}
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            offline_at = await self._go_offline(alert_bridge, clock)
+            clock[0] = offline_at + alert_bridge.DOWN_ALERT_AFTER_SECONDS - 30
+            with patch.object(alert_bridge, "get_stats_via_rcon",
+                              new_callable=AsyncMock, return_value=stats):
+                with patch.object(alert_bridge, "send_webhook_embed", new_callable=AsyncMock):
+                    await alert_bridge.poll_server_stats()
+
+        assert alert_bridge.server_online is True
+        assert alert_bridge._offline_since is None
+        alert_bridge.bot.fetch_user.return_value.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_one_dm_per_outage(self, alert_bridge):
+        """Polling every 5s must not turn one outage into a DM flood."""
+        alert_bridge.server_online = True
+        clock = [1000.0]
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            offline_at = await self._go_offline(alert_bridge, clock)
+            clock[0] = offline_at + alert_bridge.DOWN_ALERT_AFTER_SECONDS
+            with patch.object(alert_bridge, "get_stats_via_rcon",
+                              new_callable=AsyncMock, return_value=None):
+                with patch.object(alert_bridge, "send_webhook_embed", new_callable=AsyncMock):
+                    for _ in range(20):
+                        await alert_bridge.poll_server_stats()
+                        clock[0] += 60
+
+        alert_bridge.bot.fetch_user.return_value.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_recovery_sends_the_all_clear(self, alert_bridge):
+        """An alert that never resolves means checking by hand anyway."""
+        alert_bridge.server_online = True
+        clock = [1000.0]
+        stats = {"tps": 20.0, "playerCount": 0}
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            offline_at = await self._go_offline(alert_bridge, clock)
+            clock[0] = offline_at + alert_bridge.DOWN_ALERT_AFTER_SECONDS
+            with patch.object(alert_bridge, "get_stats_via_rcon",
+                              new_callable=AsyncMock, return_value=None):
+                with patch.object(alert_bridge, "send_webhook_embed", new_callable=AsyncMock):
+                    await alert_bridge.poll_server_stats()
+            clock[0] += 600
+            with patch.object(alert_bridge, "get_stats_via_rcon",
+                              new_callable=AsyncMock, return_value=stats):
+                with patch.object(alert_bridge, "send_webhook_embed", new_callable=AsyncMock):
+                    await alert_bridge.poll_server_stats()
+
+        dm = alert_bridge.bot.fetch_user.return_value.send
+        assert dm.await_count == 2
+        assert "back up" in dm.await_args[0][0].lower()
+        assert alert_bridge._down_alert_sent is False
+
+    @pytest.mark.asyncio
+    async def test_bot_restarted_during_an_outage_still_alerts(self, alert_bridge):
+        """No up->down transition to watch, but a human is still needed.
+
+        server_online starts False, so the transition branch never fires. The
+        offline stamp is set from the failure branch itself for exactly this.
+        """
+        clock = [1000.0]
+        assert alert_bridge.server_online is False
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            with patch.object(alert_bridge, "get_stats_via_rcon",
+                              new_callable=AsyncMock, return_value=None):
+                with patch.object(alert_bridge, "send_webhook_embed", new_callable=AsyncMock):
+                    await alert_bridge.poll_server_stats()
+                    clock[0] += alert_bridge.OFFLINE_AFTER_SECONDS
+                    await alert_bridge.poll_server_stats()
+                    assert alert_bridge._offline_since is not None
+                    clock[0] += alert_bridge.DOWN_ALERT_AFTER_SECONDS
+                    await alert_bridge.poll_server_stats()
+
+        alert_bridge.bot.fetch_user.return_value.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_alert_user_id_does_not_break_the_poll_loop(self, bridge):
+        """The feature is optional - without an id it logs and moves on."""
+        bridge.bot.config.alert_user_id = None
+        bridge.server_online = True
+        clock = [1000.0]
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            with patch.object(bridge, "get_stats_via_rcon", new_callable=AsyncMock, return_value=None):
+                with patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
+                    while bridge.server_online:
+                        await bridge.poll_server_stats()
+                        clock[0] += bridge.config.settings.stats_check_interval
+                    clock[0] = bridge._offline_since + bridge.DOWN_ALERT_AFTER_SECONDS
+                    await bridge.poll_server_stats()
+
+        assert bridge._down_alert_sent is True   # not retried every poll
+
+    @pytest.mark.asyncio
+    async def test_failed_dm_does_not_kill_the_poll_loop(self, alert_bridge):
+        """Closed DMs must not take the bridge down with them."""
+        alert_bridge.bot.fetch_user = AsyncMock(side_effect=RuntimeError("cannot send to user"))
+        alert_bridge.server_online = True
+        clock = [1000.0]
+
+        with patch("bot.time.time", side_effect=lambda: clock[0]):
+            offline_at = await self._go_offline(alert_bridge, clock)
+            clock[0] = offline_at + alert_bridge.DOWN_ALERT_AFTER_SECONDS
+            with patch.object(alert_bridge, "get_stats_via_rcon",
+                              new_callable=AsyncMock, return_value=None):
+                with patch.object(alert_bridge, "send_webhook_embed", new_callable=AsyncMock):
+                    await alert_bridge.poll_server_stats()   # must not raise
+
+        assert alert_bridge._down_alert_sent is True
+
+    def test_format_duration(self, bridge):
+        assert bridge._format_duration(300) == "5 minutes"
+        assert bridge._format_duration(60) == "1 minute"
+        assert bridge._format_duration(3600) == "1 hour"
+        assert bridge._format_duration(4320) == "1 hour 12 minutes"
