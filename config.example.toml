@@ -49,6 +49,12 @@ database_url  = "${ATM10_DATABASE_URL}"     # jdbc:mysql:// and mysql:// both ac
 # directory read-only - mount the directory, never the file, or log rotation
 # strands the reader on the old inode.
 log_path      = "/app/serverlogs/atm10/latest.log"
+# Optional. Path *inside this container* to the server's RCON pause flag. While
+# it reads {"shutdown": true} the bot sends no RCON at all, so the server can
+# stop without a command in flight parking its RCON thread and hanging the stop
+# until wings kills it. Written by restart_command.js; the votifier reads the
+# same file. Same directory-not-file mount rule as log_path. Omit to never pause.
+pause_flag    = "/app/flags/atm10/shutdown.json"
 # webhook_url = "${ATM10_WEBHOOK_URL}"      # only if the bot lacks MANAGE_WEBHOOKS
 # icon_url    = "https://example.com/atm10.png"   # overrides [defaults].icon_url
 

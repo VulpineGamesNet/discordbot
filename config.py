@@ -38,6 +38,20 @@ class MinecraftConfig:
     # a single-file bind mount pins the inode, so the container would keep
     # reading the pre-rotation file forever.
     log_path: str = ""
+    # Optional path to the server's RCON pause flag, as seen from inside this
+    # container. The server writes {"shutdown": true} just before it stops, and
+    # while that is set the bot sends no RCON at all.
+    #
+    # Vanilla parks the RCON thread forever if a command is in flight when the
+    # server thread reaches rconThread.stop(), which hangs the stop until wings
+    # SIGKILLs it ~30s later. The votifier has honoured this flag since
+    # 2026-08-01; this bot polls every 2-5s and did not, which is why panel
+    # stops kept hanging anyway. Unset (DeceasedCraft) means never pause.
+    #
+    # Mount the flag *directory*, not the file - same inode trap as log_path.
+    # A pack update that recreates the directory would otherwise leave the
+    # container reading an orphaned one, silently and forever.
+    pause_flag: str = ""
 
 
 @dataclass
@@ -151,6 +165,7 @@ def _server(raw: dict, defaults: dict) -> ServerConfig:
             rcon_password=_require(raw, "rcon_password", name),
             server_name=name,
             log_path=raw.get("log_path", ""),
+            pause_flag=raw.get("pause_flag", ""),
         ),
         database=DatabaseConfig(url=_require(raw, "database_url", name)),
         settings=settings,

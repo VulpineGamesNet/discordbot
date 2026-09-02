@@ -1835,3 +1835,55 @@ class TestDownAlertDM:
         assert bridge._format_duration(60) == "1 minute"
         assert bridge._format_duration(3600) == "1 hour"
         assert bridge._format_duration(4320) == "1 hour 12 minutes"
+
+
+class TestRconPauseFlag:
+    """The flag exists to stop RCON traffic while the server goes down.
+
+    It must fail OPEN: any doubt about the file means keep polling. A bug that
+    suppresses RCON forever would silently take the bridge offline, which is
+    strictly worse than the hang it prevents.
+    """
+
+    FLAG = "shutdown.json"
+
+    def _bridge(self, mock_bot, tmp_path, contents=None):
+        cfg = make_server_config()
+        flag = tmp_path / self.FLAG
+        if contents is not None:
+            flag.write_text(contents)
+        cfg.minecraft.pause_flag = str(flag)
+        return stub_db(MinecraftBridge(mock_bot, cfg))
+
+    def test_unset_never_pauses(self, bridge):
+        assert bridge.config.minecraft.pause_flag == ""
+        assert bridge._rcon_paused() is False
+
+    def test_missing_file_does_not_pause(self, mock_bot, tmp_path):
+        assert self._bridge(mock_bot, tmp_path)._rcon_paused() is False
+
+    def test_malformed_file_does_not_pause(self, mock_bot, tmp_path):
+        assert self._bridge(mock_bot, tmp_path, "{not json")._rcon_paused() is False
+
+    def test_flag_false_does_not_pause(self, mock_bot, tmp_path):
+        b = self._bridge(mock_bot, tmp_path, json.dumps({"shutdown": False}))
+        assert b._rcon_paused() is False
+
+    def test_flag_true_pauses(self, mock_bot, tmp_path):
+        b = self._bridge(mock_bot, tmp_path, json.dumps({"shutdown": True}))
+        assert b._rcon_paused() is True
+
+    def test_flag_is_reread_each_call(self, mock_bot, tmp_path):
+        """Paused is a live state, not a startup decision - the server clears
+        it again on boot and the bridge must resume without a restart."""
+        b = self._bridge(mock_bot, tmp_path, json.dumps({"shutdown": True}))
+        assert b._rcon_paused() is True
+        (tmp_path / self.FLAG).write_text(json.dumps({"shutdown": False}))
+        assert b._rcon_paused() is False
+
+    @pytest.mark.asyncio
+    async def test_send_rcon_command_short_circuits_while_paused(self, mock_bot, tmp_path):
+        """The point of the flag: no socket work at all while it is set."""
+        b = self._bridge(mock_bot, tmp_path, json.dumps({"shutdown": True}))
+        with patch.object(b, "_rcon_sync", side_effect=AssertionError("RCON used while paused")):
+            assert await b.send_rcon_command("getstats") is None

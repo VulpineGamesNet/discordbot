@@ -98,6 +98,9 @@ class MinecraftBridge(commands.Cog):
         self.DOWN_ALERT_AFTER_SECONDS: float = config.settings.down_alert_after
         self.last_stats: Optional[dict] = None
         self.rcon_lock = asyncio.Lock()
+        # Last pause state we logged, so the paused/resumed transition is
+        # reported once instead of on every poll.
+        self._rcon_pause_logged: bool = False
         self.last_topic: Optional[str] = None
         self.server_online: bool = False
         self.http_session: Optional[aiohttp.ClientSession] = None
@@ -328,8 +331,35 @@ class MinecraftBridge(commands.Cog):
             self._rcon_disconnect()
             raise ConnectionError(f"RCON disconnected: {e}")
 
+    def _rcon_paused(self) -> bool:
+        """True while the server has asked every RCON client to go quiet.
+
+        The server sets this immediately before it stops. Vanilla parks the RCON
+        thread forever if a command is in flight when the server thread reaches
+        rconThread.stop(), so the stop hangs until wings SIGKILLs it ~30s later.
+        The world is already saved by then, but it is still a kill.
+
+        A missing, unreadable or malformed flag means poll as normal. This can
+        only ever suppress RCON while the file explicitly says to - it can never
+        wedge the bridge off on its own.
+        """
+        path = self.config.minecraft.pause_flag
+        if not path:
+            return False
+        try:
+            with open(path) as fh:
+                paused = bool(json.load(fh).get("shutdown", False))
+        except (OSError, ValueError):
+            return False
+        if paused != self._rcon_pause_logged:
+            self.log.info("RCON polling %s", "paused" if paused else "resumed")
+            self._rcon_pause_logged = paused
+        return paused
+
     async def send_rcon_command(self, command: str) -> Optional[str]:
         """Send a command to Minecraft server via RCON."""
+        if self._rcon_paused():
+            return None
         async with self.rcon_lock:
             try:
                 loop = asyncio.get_event_loop()
