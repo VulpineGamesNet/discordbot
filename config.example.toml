@@ -60,8 +60,10 @@ log_path      = "/app/serverlogs/atm10/latest.log"
 # Optional. Path *inside this container* to the server's RCON pause flag. While
 # it reads {"shutdown": true} the bot sends no RCON at all, so the server can
 # stop without a command in flight parking its RCON thread and hanging the stop
-# until wings kills it. Written by restart_command.js; the votifier reads the
-# same file. Same directory-not-file mount rule as log_path. Omit to never pause.
+# until wings kills it. The votifier reads the same file. Nothing has written it
+# since the KubeJS restart script was removed on 2026-09-15; it fails open, so
+# the setting is harmless and a future writer needs no bot change. Same
+# directory-not-file mount rule as log_path. Omit to never pause.
 pause_flag    = "/app/flags/atm10/shutdown.json"
 # Optional. Pterodactyl server id (short id or uuid) for /restart. Defaults to
 # rcon_host, which under Pterodactyl already is the server uuid.

@@ -137,11 +137,10 @@ What happens:
 1. **Countdown in game** over vanilla `tellraw`: at 10m 5m 2m 1m 30s, then
    10..1, then `Restarting now!`. No script on the server is involved, so it
    works on any pack.
-2. **`restart` power signal to the panel.** Wings runs the server's own stop
-   (on ATM10 the `sstop now` command, which pauses the RCON pollers and drains
-   before stopping; on DeceasedCraft a SIGINT), kills it if that hangs, and
-   starts it again. The bot never sends a bare `stop` itself, and wings sees a
-   wanted restart, not a crash.
+2. **`restart` power signal to the panel.** Wings runs the egg's stop (a
+   console `stop` on ATM10, a SIGINT on DeceasedCraft), kills it if that
+   hangs, and starts it again. The bot never sends a `stop` itself, and wings
+   sees a wanted restart, not a crash.
 3. **Watch.** Down means the panel has moved past `stopping` - a server that is
    still saving keeps answering RCON, so neither signal alone counts. Panel
    never leaves `running` for 90s: `kill`. Panel stuck in `stopping`: `kill`

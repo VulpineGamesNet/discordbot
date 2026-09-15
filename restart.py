@@ -9,12 +9,11 @@ channel webhook and the owner DM, and the panel for the actual power cycle.
 1. Countdown in game over RCON ``tellraw``, on the cadence of the old KubeJS
    /srestart: 10m 5m 2m 1m 30s, then 10..1. Vanilla command, so it works on
    any pack.
-2. Pterodactyl ``restart`` power signal. Wings runs that server's own stop
-   command (``sstop now`` on ATM10, which pauses the RCON pollers and drains
-   before ``stop``; SIGINT on DeceasedCraft), kills it if it will not go, then
-   starts it again. The bot never sends a bare ``stop`` itself, so it needs
-   to know nothing about the pack, and wings sees an expected restart rather
-   than a crash.
+2. Pterodactyl ``restart`` power signal. Wings runs the egg's own stop (a
+   console ``stop`` on ATM10, SIGINT on DeceasedCraft), kills it if it will
+   not go, then starts it again. The bot never sends a ``stop`` itself, so it
+   needs to know nothing about the pack, and wings sees an expected restart
+   rather than a crash.
 3. Watch. Panel never leaves ``running``: ``kill`` after STOP_TIMEOUT. Stuck
    in ``stopping``: ``kill`` only after STOPPING_TIMEOUT, wings' own limit -
    a save in progress must never be killed early. Down but wings leaves it
