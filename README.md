@@ -33,6 +33,9 @@ Per server:
 - DM to the owner when a server stays offline past `down_alert_after` (default
   5 min) and an all-clear when it comes back - see [Down alerts](#down-alerts)
 - `/players` slash command — resolves which server from the channel it was run in
+- `/restart [minutes]` and `/restart-cancel` for holders of that server's Admin
+  role - in-game countdown, then a restart through the Pterodactyl panel, watched
+  until the server answers again - see [Restarting a server](#restarting-a-server)
 
 If one server's RCON or database is down, the others keep working.
 
@@ -108,6 +111,71 @@ The bot can only DM someone who shares a server with it. If the DM fails
 retried, because neither cause is fixable at runtime. With no `alert_user_id`
 set, the alert is written to the log instead.
 
+## Restarting a server
+
+`/restart` in a bridged channel restarts that channel's server after a countdown
+(default 5 minutes, `/restart minutes:3` for 3, range 1-60). `/restart-cancel`
+stops the countdown as long as the restart signal has not gone out yet. One
+restart per server at a time: a second `/restart` is refused until the first is
+cancelled or done. Lives in `restart.py`, apart from the bridge.
+
+```toml
+[pterodactyl]
+url     = "https://panel.example.com"
+api_key = "${PTERODACTYL_API_KEY}"     # client key, Account -> API Credentials
+```
+
+Without a `[pterodactyl]` table the two commands are not registered at all. The
+server id sent to the panel is `pterodactyl_id`, defaulting to `rcon_host`,
+which under Pterodactyl already is the server uuid.
+
+What happens:
+
+0. **Ask the panel first.** A wrong `pterodactyl_id`, a bad key or an
+   unreachable panel is refused on the spot, not discovered after a five
+   minute countdown. So is a server the panel does not report as `running`.
+1. **Countdown in game** over vanilla `tellraw`: at 10m 5m 2m 1m 30s, then
+   10..1, then `Restarting now!`. No script on the server is involved, so it
+   works on any pack.
+2. **`restart` power signal to the panel.** Wings runs the server's own stop
+   (on ATM10 the `sstop now` command, which pauses the RCON pollers and drains
+   before stopping; on DeceasedCraft a SIGINT), kills it if that hangs, and
+   starts it again. The bot never sends a bare `stop` itself, and wings sees a
+   wanted restart, not a crash.
+3. **Watch.** Down means the panel has moved past `stopping` - a server that is
+   still saving keeps answering RCON, so neither signal alone counts. Panel
+   never leaves `running` for 90s: `kill`. Panel stuck in `stopping`: `kill`
+   only after 10 minutes, wings' own limit, because a slow save must never be
+   killed. Panel `offline` for 30s, or no RCON answer 5 minutes after it went
+   down: `start`. A boot the panel reports as `starting` gets 15 minutes.
+   Past that: give up.
+
+The channel gets one embed when a restart is scheduled and one if it is
+cancelled; the usual `is restarting...` / `is now online` embeds follow from the
+status poll as always. `alert_user_id` is DMed on schedule, cancel, back-up (with
+how long it took) and failure. A bot restart forgets a countdown in progress.
+
+### Who may run it
+
+The bot creates one role per server, named `<server name> Admin` - `Vulpine
+ATM10 Admin`, `Vulpine DC Admin` - on startup if missing, and deletes a
+`... Admin` role that matches no configured server **if the audit log shows
+this bot created it**. A hand-made role is never touched, whatever it is
+called. Renaming a server therefore drops the old role together with whoever
+held it. The bot needs **Manage Roles** for the roles and **View Audit Log**
+for the cleanup; without the latter stale roles are only logged. The audit
+log keeps 45 days, so a role left over from a rename older than that is logged
+too, and deleting it is up to you. Assign the roles to people by hand.
+
+The guild owner may always run the commands. Everyone else needs the Admin role
+of the server behind the channel; the bot checks this itself, so a `Vulpine DC
+Admin` running `/restart` in the ATM10 channel is refused.
+
+Discord does not let a bot restrict who *sees* a slash command by role. The
+commands are registered as administrator-only, which hides them from everyone
+else; to let the Admin roles see them, do this once per role in **Server
+Settings → Integrations → (the bot) → `/restart` and `/restart-cancel`**.
+
 ## Adding a server
 
 Append a `[[servers]]` block to `config.toml`, add its two secrets to `.env`,
@@ -118,6 +186,7 @@ change and no slash-command re-sync.
 
 Per bridged channel: **View Channel**, Send Messages, Embed Links, Attach
 Files, Read Message History, Manage Webhooks, Manage Channels (for the topic).
+Server-wide: Manage Roles and View Audit Log, for the `/restart` Admin roles.
 Enable the **Message Content Intent** in the Developer Portal. Without Manage
 Webhooks, create a webhook by hand and set `webhook_url` in that server's block.
 

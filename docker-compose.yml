@@ -34,7 +34,14 @@ services:
       # inode for ten days without a single error line.
       - /var/lib/pterodactyl/volumes/284c8202-2eb5-4ba2-b7b9-519145422945/votifier_flags:/app/flags/atm10:ro
     networks:
-      - pterodactyl_nw
+      pterodactyl_nw:
+        # Fixed address so the Pterodactyl client API key used by /restart can
+        # be locked to it (Allowed IPs on the key). The panel runs on the host
+        # and sees this container's network address as the request source, so
+        # a leaked key is useless from anywhere else. Dynamic allocation hands
+        # out the lowest free addresses, hence a high one to stay clear of the
+        # game servers wings creates.
+        ipv4_address: 172.18.0.250
 
 # Use external Pterodactyl network for RCON access
 networks:

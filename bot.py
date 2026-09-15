@@ -32,6 +32,7 @@ from PIL import Image
 from config import BotConfig, ServerConfig, load_config
 from database import DatabaseManager
 from models import DiscordEvent
+from restart import RestartCommands
 
 logging.basicConfig(
     level=logging.INFO,
@@ -717,7 +718,7 @@ class MinecraftBridge(commands.Cog):
             if self._down_alert_sent:
                 self._down_alert_sent = False
                 offline_for = now - offline_since if offline_since else 0.0
-                await self._send_down_alert_dm(
+                await self.dm_owner(
                     f"\u2705 **{self.config.minecraft.server_name}** is back up "
                     f"after {self._format_duration(offline_for)} offline."
                 )
@@ -774,7 +775,7 @@ class MinecraftBridge(commands.Cog):
                 and now - self._offline_since >= self.DOWN_ALERT_AFTER_SECONDS
             ):
                 self._down_alert_sent = True
-                await self._send_down_alert_dm(
+                await self.dm_owner(
                     f"\U0001f6a8 **{self.config.minecraft.server_name}** has been offline for "
                     f"{self._format_duration(now - self._offline_since)} and has not come back "
                     f"on its own."
@@ -807,21 +808,22 @@ class MinecraftBridge(commands.Cog):
             text += f" {minutes} minute{'s' if minutes != 1 else ''}"
         return text
 
-    async def _send_down_alert_dm(self, text: str) -> None:
-        """DM the configured owner. Never raises - the poll loop must survive it."""
+    async def dm_owner(self, text: str) -> None:
+        """DM the configured owner (outage alerts, /restart notices). Never
+        raises - the poll loop must survive it."""
         user_id = self.bot.config.alert_user_id
         if not user_id:
-            self.log.warning("Down alert not sent - [discord].alert_user_id is not set: %s", text)
+            self.log.warning("Owner DM not sent - [discord].alert_user_id is not set: %s", text)
             return
         try:
             user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
             await user.send(text)
-            self.log.info("Down alert DM sent to %s", user_id)
+            self.log.info("Owner DM sent to %s", user_id)
         except Exception as e:
             # Closed DMs and a wrong id both land here and neither is fixable at
             # runtime, so log it and carry on watching the server rather than
             # retrying forever or killing the poll loop.
-            self.log.error("Down alert DM to %s failed: %s", user_id, e)
+            self.log.error("Owner DM to %s failed: %s", user_id, e)
 
     STATUS_RETRY_DELAY: float = 2.0  # seconds before retrying a failed status webhook
 
@@ -1276,6 +1278,11 @@ class DiscordMCBot(commands.Bot):
             logger.info("Loaded bridge %s -> channel %s", name, server.discord.channel_id)
 
         await self.add_cog(ServerCommands(self))
+        # /restart needs the panel; without [pterodactyl] the commands do not exist.
+        if self.config.pterodactyl:
+            await self.add_cog(RestartCommands(self))
+        else:
+            logger.info("[pterodactyl] not configured - /restart disabled")
 
         # Sync slash commands
         try:

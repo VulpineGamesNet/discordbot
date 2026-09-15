@@ -18,6 +18,14 @@ guild_id = 123456789012345678
 # alert is only written to the log.
 alert_user_id = 123456789012345678
 
+# Optional. Enables /restart and /restart-cancel. The bot restarts a server
+# through the panel's client API, so it needs a client API key from an account
+# that can see every server below. Leave the table out to disable the module;
+# an empty api_key is a startup error, not "disabled".
+# [pterodactyl]
+# url     = "https://panel.example.com"
+# api_key = "${PTERODACTYL_API_KEY}"
+
 # Applied to every [[servers]] block. Any key here may be overridden per server.
 [defaults]
 stats_check_interval = 5     # RCON getstats poll, seconds
@@ -55,6 +63,9 @@ log_path      = "/app/serverlogs/atm10/latest.log"
 # until wings kills it. Written by restart_command.js; the votifier reads the
 # same file. Same directory-not-file mount rule as log_path. Omit to never pause.
 pause_flag    = "/app/flags/atm10/shutdown.json"
+# Optional. Pterodactyl server id (short id or uuid) for /restart. Defaults to
+# rcon_host, which under Pterodactyl already is the server uuid.
+# pterodactyl_id = "284c8202-2eb5-4ba2-b7b9-519145422945"
 # webhook_url = "${ATM10_WEBHOOK_URL}"      # only if the bot lacks MANAGE_WEBHOOKS
 # icon_url    = "https://example.com/atm10.png"   # overrides [defaults].icon_url
 

@@ -236,3 +236,32 @@ class TestDataclasses:
         assert config.token == "t"
         assert config.guild_id is None
         assert len(config.servers) == 1
+
+
+class TestPterodactylConfig:
+    """[pterodactyl] is optional; when present both keys are required."""
+
+    def test_absent_means_disabled(self, write_config):
+        config = load_config(write_config(TWO_SERVERS), env_file=None)
+        assert config.pterodactyl is None
+
+    def test_parsed_and_id_defaults_to_rcon_host(self, write_config, monkeypatch):
+        monkeypatch.setenv("PANEL_KEY", "ptlc_secret")
+        text = TWO_SERVERS + '\n[pterodactyl]\nurl = "https://panel.test/"\napi_key = "${PANEL_KEY}"\n'
+        config = load_config(write_config(text), env_file=None)
+
+        assert config.pterodactyl.url == "https://panel.test"  # trailing slash dropped
+        assert config.pterodactyl.api_key == "ptlc_secret"
+        alpha, beta = config.servers
+        assert alpha.minecraft.pterodactyl_id == "alpha-host"
+        assert beta.minecraft.pterodactyl_id == "localhost"
+
+    def test_explicit_id_wins(self, write_config):
+        text = TWO_SERVERS.replace('rcon_host = "alpha-host"', 'rcon_host = "alpha-host"\npterodactyl_id = "abcd1234"')
+        config = load_config(write_config(text), env_file=None)
+        assert config.servers[0].minecraft.pterodactyl_id == "abcd1234"
+
+    def test_missing_key_raises(self, write_config):
+        text = TWO_SERVERS + '\n[pterodactyl]\nurl = "https://panel.test"\n'
+        with pytest.raises(ValueError, match="pterodactyl"):
+            load_config(write_config(text), env_file=None)

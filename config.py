@@ -52,6 +52,9 @@ class MinecraftConfig:
     # A pack update that recreates the directory would otherwise leave the
     # container reading an orphaned one, silently and forever.
     pause_flag: str = ""
+    # Pterodactyl server identifier (short id or full uuid) for /restart.
+    # Defaults to rcon_host, which under Pterodactyl is the server uuid.
+    pterodactyl_id: str = ""
 
 
 @dataclass
@@ -98,6 +101,14 @@ class ServerConfig:
 
 
 @dataclass
+class PterodactylConfig:
+    """Panel client API access, used by /restart to bounce a server."""
+
+    url: str
+    api_key: str
+
+
+@dataclass
 class BotConfig:
     """Bot-global configuration plus the list of bridged servers."""
 
@@ -108,6 +119,8 @@ class BotConfig:
     # Optional: without it the alert is only logged and everything else works
     # unchanged.
     alert_user_id: Optional[int] = None
+    # Optional. Without it the /restart module is not loaded at all.
+    pterodactyl: Optional[PterodactylConfig] = None
 
 
 # Keys of Settings, used to split per-server tunables from connection details.
@@ -152,6 +165,7 @@ def _server(raw: dict, defaults: dict) -> ServerConfig:
 
     overrides = {k: raw[k] for k in _SETTINGS_FIELDS & raw.keys()}
     settings = Settings(**{**defaults, **overrides})
+    rcon_host = raw.get("rcon_host", "localhost")
 
     return ServerConfig(
         discord=DiscordConfig(
@@ -160,12 +174,13 @@ def _server(raw: dict, defaults: dict) -> ServerConfig:
             icon_url=raw.get("icon_url", ""),
         ),
         minecraft=MinecraftConfig(
-            rcon_host=raw.get("rcon_host", "localhost"),
+            rcon_host=rcon_host,
             rcon_port=int(raw.get("rcon_port", 25575)),
             rcon_password=_require(raw, "rcon_password", name),
             server_name=name,
             log_path=raw.get("log_path", ""),
             pause_flag=raw.get("pause_flag", ""),
+            pterodactyl_id=raw.get("pterodactyl_id") or rcon_host,
         ),
         database=DatabaseConfig(url=_require(raw, "database_url", name)),
         settings=settings,
@@ -232,9 +247,18 @@ def load_config(path: str = "config.toml", env_file: Optional[str] = ".env") -> 
             )
         seen[channel_id] = server.minecraft.server_name
 
+    ptero_raw = raw.get("pterodactyl")
+    pterodactyl = None
+    if ptero_raw:
+        url, api_key = ptero_raw.get("url"), ptero_raw.get("api_key")
+        if not url or not api_key:
+            raise ValueError("[pterodactyl] needs both 'url' and 'api_key'")
+        pterodactyl = PterodactylConfig(url=url.rstrip("/"), api_key=api_key)
+
     return BotConfig(
         token=token,
         servers=servers,
         guild_id=int(discord["guild_id"]) if discord.get("guild_id") else None,
         alert_user_id=int(discord["alert_user_id"]) if discord.get("alert_user_id") else None,
+        pterodactyl=pterodactyl,
     )
