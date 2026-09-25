@@ -39,14 +39,15 @@ class MinecraftConfig:
     # reading the pre-rotation file forever.
     log_path: str = ""
     # Optional path to the server's RCON pause flag, as seen from inside this
-    # container. The server writes {"shutdown": true} just before it stops, and
-    # while that is set the bot sends no RCON at all.
+    # container. /restart writes {"shutdown": true} just before the power
+    # signal and false once the old process is gone; while it is true neither
+    # this bot nor the votifier sends any RCON.
     #
     # Vanilla parks the RCON thread forever if a command is in flight when the
     # server thread reaches rconThread.stop(), which hangs the stop until wings
-    # SIGKILLs it ~30s later. The votifier has honoured this flag since
-    # 2026-08-01; this bot polls every 2-5s and did not, which is why panel
-    # stops kept hanging anyway. Unset (DeceasedCraft) means never pause.
+    # SIGKILLs it at its ten-minute limit. The votifier has honoured this flag
+    # since 2026-08-01; this bot polls every 2-5s and did not, which is why
+    # panel stops kept hanging anyway. Unset (DeceasedCraft) means never pause.
     #
     # Mount the flag *directory*, not the file - same inode trap as log_path.
     # A pack update that recreates the directory would otherwise leave the

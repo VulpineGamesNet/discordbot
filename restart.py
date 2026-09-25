@@ -91,6 +91,9 @@ class RestartCommands(commands.Cog):
     # matches are skipped because the scheduling announcement already says it.
     WARNINGS = (600, 300, 120, 60, 30, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1)
     POLL: float = 5.0
+    # After raising the pause flag, before the power signal: the votifier goes
+    # quiet in ~1s, this bot's slowest poll loop is 5s.
+    DRAIN: float = 6.0
     STOP_TIMEOUT: float = 90.0  # panel never left `running` -> kill
     STOPPING_TIMEOUT: float = 600.0  # panel stuck in `stopping` -> kill; wings' own limit
     KILL_TIMEOUT: float = 60.0  # after kill, before giving up
@@ -390,22 +393,31 @@ class RestartCommands(commands.Cog):
         name = bridge.config.minecraft.server_name
         started = time.time()
 
-        await self.ptero.power(sid, "restart")
-        bridge.log.info("Pterodactyl restart signal sent")
+        # Every RCON client quiet before the stop: a command in flight when the
+        # server thread reaches rconThread.stop() parks there forever and the
+        # stop hangs until wings kills it. The flag comes down again the moment
+        # the old process is gone - the watch below needs RCON, and a flag left
+        # up would take the whole bridge offline.
+        if self._set_pause(bridge, True):
+            await asyncio.sleep(self.DRAIN)
+        try:
+            await self.ptero.power(sid, "restart")
+            bridge.log.info("Pterodactyl restart signal sent")
 
-        # Going down. Wings kills on its own once its stop timeout passes; the
-        # kill here is for a wings that never acted (still `running`) or one
-        # that is stuck (`stopping` past wings' own limit) - never for a save
-        # that is merely slow.
-        if not await self._wait_down(sid, self.STOP_TIMEOUT, self.STOPPING_TIMEOUT):
-            bridge.log.warning("Not down after the restart signal - sending kill")
-            await self._power_quietly(bridge, sid, "kill")
-            if not await self._wait_down(sid, self.KILL_TIMEOUT):
-                raise RuntimeError(f"still not down {self.KILL_TIMEOUT:.0f}s after kill")
+            # Going down. Wings kills on its own once its stop timeout passes; the
+            # kill here is for a wings that never acted (still `running`) or one
+            # that is stuck (`stopping` past wings' own limit) - never for a save
+            # that is merely slow.
+            if not await self._wait_down(sid, self.STOP_TIMEOUT, self.STOPPING_TIMEOUT):
+                bridge.log.warning("Not down after the restart signal - sending kill")
+                await self._power_quietly(bridge, sid, "kill")
+                if not await self._wait_down(sid, self.KILL_TIMEOUT):
+                    raise RuntimeError(f"still not down {self.KILL_TIMEOUT:.0f}s after kill")
+        finally:
+            self._set_pause(bridge, False)
         bridge.log.info("Server is down, waiting for it to come back")
 
-        # Coming up. Ready means RCON answers a vanilla command: on ATM10 that
-        # also implies the pause flag was cleared by the new boot.
+        # Coming up. Ready means RCON answers a vanilla command.
         started_again = False
         phase_start = time.time()
         offline_polls = 0
@@ -470,6 +482,29 @@ class RestartCommands(commands.Cog):
             if time.time() - began >= timeout:
                 return False
             await asyncio.sleep(self.POLL)
+
+    @staticmethod
+    def _set_pause(bridge, paused: bool) -> bool:
+        """Write the server's RCON pause flag; True if it was written.
+
+        The same file this bot and the votifier read (`pause_flag`). No flag
+        configured, or the mount not writable: log and carry on - a restart
+        with live pollers hangs until wings kills it, but it still restarts.
+        """
+        path = bridge.config.minecraft.pause_flag
+        if not path:
+            return False
+        try:
+            with open(path, "w") as fh:
+                json.dump({"shutdown": paused}, fh)
+        except OSError as e:
+            bridge.log.warning(
+                "RCON pause flag %s not written (%s)%s", path, e,
+                " - the stop may hang until wings kills it" if paused else "",
+            )
+            return False
+        bridge.log.info("RCON pause flag %s", "raised" if paused else "cleared")
+        return True
 
     async def _power_quietly(self, bridge, sid: str, signal: str) -> None:
         """Escalation signals are best effort: wings refuses one while it is

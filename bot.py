@@ -152,6 +152,10 @@ class MinecraftBridge(commands.Cog):
         # allowed to post an "is now online" in the middle of the outage.
         self._down_confirmed: bool = False
         self._log_down_at: float = 0.0
+        # When the log said the save was complete, and whether this stop has
+        # already had its kill. Both reset when the log rotates (new boot).
+        self._log_saved_at: Optional[float] = None
+        self._stuck_kill_sent: bool = False
         # Database manager for Discord events
         self.db_manager: DatabaseManager = DatabaseManager(config.database, server_name)
         # name (lowercased) -> (member id or None, when the answer expires)
@@ -891,6 +895,17 @@ class MinecraftBridge(commands.Cog):
     # How long RCON may keep answering after a log warning before the warning
     # is judged wrong. Longer than any save; shorter than a restart.
     LOG_DOWN_GRACE: float = 60.0
+    # A stop that has saved and will not exit. Vanilla prints this from
+    # GenericThread.stop() once the RCON thread has ignored five seconds of
+    # interrupts: a command was in flight when the server thread reached
+    # rconThread.stop() and it never returns. Everything is on disk by then,
+    # and wings only acts at its own ten-minute limit (2026-09-25).
+    LOG_STUCK_STOP_MARKER = "attempting force stop!"
+    # The save-complete line. Nothing that reaches the world runs after it; a
+    # server still stopping this long later is hung in some mod's shutdown
+    # (DeceasedCraft: the voice chat thread) and only a kill ends it.
+    LOG_SAVED_MARKER = "All dimensions are saved"
+    STOP_SAVED_GRACE: float = 90.0
     # Only inspect the tail of a burst; a crashing server can emit a very
     # large report and none of it changes the verdict.
     LOG_MAX_LINES_PER_TICK = 400
@@ -917,6 +932,9 @@ class MinecraftBridge(commands.Cog):
             self.log.info("Server log rotated, following the new file")
             self._log_inode = stat.st_ino
             self._log_pos = 0
+            # A new file is a new boot: the previous stop is over, however it ended.
+            self._log_saved_at = None
+            self._stuck_kill_sent = False
 
         if stat.st_size == self._log_pos:
             return []
@@ -940,17 +958,64 @@ class MinecraftBridge(commands.Cog):
         2026-08-03 out-of-memory crash took minutes. The log says so
         immediately, and says why.
         """
-        if not self.log_path or self._crash_announced:
+        if not self.log_path:
             return
 
         loop = asyncio.get_event_loop()
         lines = await loop.run_in_executor(None, self._read_new_log_lines)
 
         for line in lines:
+            if self.LOG_STUCK_STOP_MARKER in line:
+                await self._kill_stuck_stop(line.strip()[:160])
+                return
+            if self.LOG_SAVED_MARKER in line:
+                self._log_saved_at = time.time()
+            if self._crash_announced:
+                continue
             for marker, reason in self.LOG_CRASH_MARKERS:
                 if marker in line:
                     await self._announce_from_log(reason, line)
-                    return
+                    break
+
+        if self._log_saved_at and time.time() - self._log_saved_at >= self.STOP_SAVED_GRACE:
+            self._log_saved_at = None
+            await self._kill_stuck_stop(
+                f"still not exited {self.STOP_SAVED_GRACE:.0f}s after '{self.LOG_SAVED_MARKER}'"
+            )
+
+    async def _kill_stuck_stop(self, why: str) -> None:
+        """Kill a server that has saved and will not exit.
+
+        The world is on disk; what is left is a thread that never returns, and
+        wings only steps in after its own ten minutes. Needs the panel client
+        from the restart module. Once per stop: a kill while wings is inside a
+        stop or restart action ends that action normally (kill bypasses the
+        power lock), so a restart in progress carries on to the boot.
+        """
+        if self._stuck_kill_sent:
+            return
+        self._stuck_kill_sent = True
+        name = self.config.minecraft.server_name
+        ptero = getattr(self.bot.get_cog("RestartCommands"), "ptero", None)
+        if ptero is None:
+            self.log.warning("Stop is hung (%s) and there is no panel access to kill it", why)
+            return
+        sid = self.config.minecraft.pterodactyl_id
+        state = await ptero.state(sid)
+        if state in ("offline", "starting"):
+            self.log.info("Stop looked hung (%s) but the panel says %s - nothing to kill", why, state)
+            return
+        self.log.warning("Stop hung after the save (%s) - sending kill", why)
+        try:
+            await ptero.power(sid, "kill")
+        except Exception as e:
+            self.log.warning("Pterodactyl kill refused: %s", e)
+            await self.dm_owner(f"\U0001f6a8 **{name}** is hung after saving and the kill was refused: {e}")
+            return
+        await self.dm_owner(
+            f"\U0001f480 **{name}** hung after saving ({why}) - sent kill. "
+            f"Wings boots it again if a restart was in progress."
+        )
 
     async def _announce_from_log(self, reason: str, line: str) -> None:
         """Post a crash notice found in the log and suppress the RCON one."""

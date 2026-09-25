@@ -137,10 +137,18 @@ What happens:
 1. **Countdown in game** over vanilla `tellraw`: at 10m 5m 2m 1m 30s, then
    10..1, then `Restarting now!`. No script on the server is involved, so it
    works on any pack.
-2. **`restart` power signal to the panel.** Wings runs the egg's stop (a
-   console `stop` on ATM10, a SIGINT on DeceasedCraft), kills it if that
-   hangs, and starts it again. The bot never sends a `stop` itself, and wings
-   sees a wanted restart, not a crash.
+2. **RCON pause flag up, then the `restart` power signal.** If the server has a
+   `pause_flag`, the bot writes `{"shutdown": true}` to it and waits 6 s for
+   commands in flight (its own polls, the votifier's) to drain, because a
+   vanilla stop with an RCON command in flight parks the RCON thread and never
+   exits - on 2026-09-25 ATM10 sat saved-but-alive for the full ten minutes of
+   wings' stop timeout. Then wings runs the egg's stop (a console `stop` on
+   ATM10, a SIGINT on DeceasedCraft), kills it if that hangs, and starts it
+   again. The bot never sends a `stop` itself, and wings sees a wanted restart,
+   not a crash. The flag is cleared the moment the old process is gone, before
+   the watch below starts asking RCON. The flag directory must be mounted
+   writable for this; a read-only mount is logged and the restart goes ahead
+   without the pause.
 3. **Watch.** Down means the panel has moved past `stopping` - a server that is
    still saving keeps answering RCON, so neither signal alone counts. Panel
    never leaves `running` for 90s: `kill`. Panel stuck in `stopping`: `kill`
@@ -148,6 +156,16 @@ What happens:
    killed. Panel `offline` for 30s, or no RCON answer 5 minutes after it went
    down: `start`. A boot the panel reports as `starting` gets 15 minutes.
    Past that: give up.
+
+Independently of `/restart`, the server-log watcher (`log_path`) recognises a
+stop that has finished saving and will not exit, whoever started it - panel
+Stop, `/restart`, an in-game `stop`. `Waited N seconds attempting force stop!`
+is vanilla's RCON thread refusing to die after the save; `All dimensions are
+saved` followed by 90 s of still `stopping` is the same hang without the line
+(DeceasedCraft). Either sends one `kill` through the panel. Kill bypasses wings'
+power lock, so a `/restart` or panel restart in progress simply continues to the
+boot; a panel Stop stays stopped. The owner is DMed. Nothing is lost: nothing
+that reaches the world runs after the save line.
 
 The channel gets one embed when a restart is scheduled and one if it is
 cancelled; the usual `is restarting...` / `is now online` embeds follow from the

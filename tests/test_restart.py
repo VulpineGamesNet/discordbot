@@ -349,6 +349,51 @@ class TestBounce:
         assert cog.ptero.signals == ["restart", "start"]
 
     @pytest.mark.asyncio
+    async def test_pause_flag_up_for_the_signal_and_down_once_gone(self, cog, bridge, tmp_path):
+        """2026-09-25: a bare stop with the RCON pollers live hung ATM10 after
+        the save until wings' ten-minute kill. The flag must be up when the
+        signal goes out, and down again as soon as the old process is gone -
+        the watch that follows needs RCON, and a flag left up would take the
+        whole bridge offline."""
+        flag = tmp_path / "flag.json"
+        bridge.config.minecraft.pause_flag = str(flag)
+        cog.DRAIN = 0
+        ptero = FakePtero(["running", "stopping", "offline", "running"])
+        seen = []
+        power = ptero.power
+
+        async def spy(server, signal):
+            seen.append(json.loads(flag.read_text())["shutdown"])
+            await power(server, signal)
+
+        ptero.power = spy
+        cog.ptero = ptero
+        bridge.send_rcon_command = AsyncMock(return_value="ok")
+        await cog._bounce(bridge)
+        assert seen == [True]
+        assert json.loads(flag.read_text()) == {"shutdown": False}
+
+    @pytest.mark.asyncio
+    async def test_pause_flag_cleared_when_the_signal_fails(self, cog, bridge, tmp_path):
+        flag = tmp_path / "flag.json"
+        bridge.config.minecraft.pause_flag = str(flag)
+        cog.DRAIN = 0
+        cog.ptero = MagicMock()
+        cog.ptero.power = AsyncMock(side_effect=RuntimeError("HTTP 401"))
+        with pytest.raises(RuntimeError, match="HTTP 401"):
+            await cog._bounce(bridge)
+        assert json.loads(flag.read_text()) == {"shutdown": False}
+
+    @pytest.mark.asyncio
+    async def test_unwritable_pause_flag_still_restarts(self, cog, bridge, tmp_path):
+        """A read-only mount must cost the hang, never the restart."""
+        bridge.config.minecraft.pause_flag = str(tmp_path / "missing" / "flag.json")
+        cog.ptero = FakePtero(["offline", "running"])
+        bridge.send_rcon_command = AsyncMock(return_value="ok")
+        await cog._bounce(bridge)
+        assert cog.ptero.signals == ["restart"]
+
+    @pytest.mark.asyncio
     async def test_failure_is_dmed_and_job_cleared(self, cog, bridge):
         cog.ptero = MagicMock()
         cog.ptero.power = AsyncMock(side_effect=RuntimeError("HTTP 401"))

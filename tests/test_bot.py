@@ -1556,6 +1556,76 @@ class TestServerLogWatch:
             await bridge.watch_server_log()
         embed.assert_not_called()
 
+    def _panel(self, bridge, state="stopping"):
+        """A restart cog with a scripted panel, hung on the bridge's bot."""
+        panel = MagicMock()
+        panel.state = AsyncMock(return_value=state)
+        panel.power = AsyncMock()
+        bridge.bot.get_cog = MagicMock(return_value=MagicMock(ptero=panel))
+        return panel
+
+    @pytest.mark.asyncio
+    async def test_hung_stop_is_killed_once(self, log_bridge):
+        """2026-09-25: 'Waited N seconds attempting force stop!' every second
+        for ten minutes after the world was saved, until wings' own kill."""
+        bridge, log = log_bridge
+        panel = self._panel(bridge)
+        with patch.object(bridge, "dm_owner", new_callable=AsyncMock) as dm:
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("[12:20:38] [Server thread/INFO]: ThreadedAnvilChunkStorage: All dimensions are saved\n")
+                f.write("[12:21:05] [Server thread/WARN]: Waited 5 seconds attempting force stop!\n")
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("[12:21:06] [Server thread/WARN]: Waited 6 seconds attempting force stop!\n")
+            await bridge.watch_server_log()
+        panel.power.assert_awaited_once_with(bridge.config.minecraft.pterodactyl_id, "kill")
+        assert "kill" in dm.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_saved_but_never_exited_is_killed_after_grace(self, log_bridge):
+        """DeceasedCraft's hang prints no force-stop line: the save completes
+        and nothing follows. Still stopping well past the save is the same kill."""
+        bridge, log = log_bridge
+        panel = self._panel(bridge)
+        bridge.STOP_SAVED_GRACE = 0
+        with patch.object(bridge, "dm_owner", new_callable=AsyncMock):
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("[12:20:38] [Server thread/INFO]: ThreadedAnvilChunkStorage: All dimensions are saved\n")
+            await bridge.watch_server_log()
+            await bridge.watch_server_log()
+        panel.power.assert_awaited_once_with(bridge.config.minecraft.pterodactyl_id, "kill")
+
+    @pytest.mark.asyncio
+    async def test_gone_server_is_not_killed(self, log_bridge):
+        """A normal stop passes the save line too; by the time the grace is up
+        the panel says offline, or the new boot has rotated the log."""
+        bridge, log = log_bridge
+        panel = self._panel(bridge, state="offline")
+        bridge.STOP_SAVED_GRACE = 0
+        with patch.object(bridge, "dm_owner", new_callable=AsyncMock):
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("All dimensions are saved\n")
+            await bridge.watch_server_log()
+        panel.power.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rotation_rearms_the_kill(self, log_bridge):
+        bridge, log = log_bridge
+        panel = self._panel(bridge)
+        with patch.object(bridge, "dm_owner", new_callable=AsyncMock):
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("padding\n" * 5)
+                f.write("Waited 5 seconds attempting force stop!\n")
+            await bridge.watch_server_log()
+            log.unlink()                                                  # next boot
+            log.write_text("Waited 5 seconds attempting force stop!\n")   # hangs again
+            await bridge.watch_server_log()
+        assert panel.power.await_count == 2
+
     @pytest.mark.asyncio
     async def test_disabled_when_no_log_path(self, bridge):
         """Servers without log_path keep working, just without this signal."""
