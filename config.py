@@ -56,6 +56,19 @@ class MinecraftConfig:
     # Pterodactyl server identifier (short id or full uuid) for /restart.
     # Defaults to rcon_host, which under Pterodactyl is the server uuid.
     pterodactyl_id: str = ""
+    # How the Minecraft half of the bridge is built.
+    #   "kubejs"  - the KubeJS script under minecraft/: chat/join/leave arrive
+    #               through the discord_events table, stats from /getstats,
+    #               Discord messages go out through /discordmsg.
+    #   "vanilla" - nothing installed in the pack, for loaders with no KubeJS
+    #               (1.12.2 Forge): chat/join/leave are read from log_path,
+    #               stats from vanilla "list uuids" + "forge tps", Discord
+    #               messages go out as vanilla tellraw. Needs log_path; no
+    #               database.
+    bridge: str = "kubejs"
+
+
+BRIDGE_MODES = ("kubejs", "vanilla")
 
 
 @dataclass
@@ -167,6 +180,12 @@ def _server(raw: dict, defaults: dict) -> ServerConfig:
     overrides = {k: raw[k] for k in _SETTINGS_FIELDS & raw.keys()}
     settings = Settings(**{**defaults, **overrides})
     rcon_host = raw.get("rcon_host", "localhost")
+    bridge = raw.get("bridge", "kubejs")
+    if bridge not in BRIDGE_MODES:
+        raise ValueError(
+            f"server '{name}': bridge must be one of {', '.join(BRIDGE_MODES)}, not {bridge!r}"
+        )
+    vanilla = bridge == "vanilla"
 
     return ServerConfig(
         discord=DiscordConfig(
@@ -179,11 +198,17 @@ def _server(raw: dict, defaults: dict) -> ServerConfig:
             rcon_port=int(raw.get("rcon_port", 25575)),
             rcon_password=_require(raw, "rcon_password", name),
             server_name=name,
-            log_path=raw.get("log_path", ""),
+            # The log is a vanilla bridge's only source of chat: without it
+            # Discord -> Minecraft would work and the other way silently not.
+            log_path=_require(raw, "log_path", name) if vanilla else raw.get("log_path", ""),
             pause_flag=raw.get("pause_flag", ""),
             pterodactyl_id=raw.get("pterodactyl_id") or rcon_host,
+            bridge=bridge,
         ),
-        database=DatabaseConfig(url=_require(raw, "database_url", name)),
+        # A vanilla bridge has no events table, so no database.
+        database=DatabaseConfig(
+            url=raw.get("database_url", "") if vanilla else _require(raw, "database_url", name)
+        ),
         settings=settings,
     )
 

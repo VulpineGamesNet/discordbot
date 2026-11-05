@@ -74,6 +74,23 @@ class Pterodactyl:
         except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, ValueError):
             return None
 
+    async def uptime(self, server: str) -> Optional[float]:
+        """Seconds the server process has been up (0 while offline), or None
+        if the panel did not say. The vanilla bridge's stand-in for the uptime
+        a KubeJS server reports through /getstats."""
+        try:
+            async with self.session.get(
+                f"{self.url}/api/client/servers/{server}/resources",
+                headers=self.headers,
+                timeout=self.timeout,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                ms = (await resp.json())["attributes"]["resources"]["uptime"]
+                return float(ms) / 1000.0
+        except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, ValueError, TypeError):
+            return None
+
 
 @dataclass
 class RestartJob:

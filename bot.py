@@ -5,7 +5,8 @@ One process bridges N Minecraft servers. Each server gets its own Discord
 channel, RCON endpoint and MySQL database, defined by a [[servers]] block in
 config.toml. Per server it handles:
 - Discord -> Minecraft chat relay via RCON
-- Minecraft -> Discord chat relay via webhook (polling the discord_events table)
+- Minecraft -> Discord chat relay via webhook (polling the discord_events table,
+  or reading the server log for a `bridge = "vanilla"` server with no KubeJS)
 - Channel topic updates with server stats (TPS, players, uptime)
 - Server start/stop notifications (via RCON connectivity monitoring)
 """
@@ -21,7 +22,7 @@ import socket
 import struct
 import time
 import traceback
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import aiohttp
 import discord
@@ -42,6 +43,19 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("discord_mc_bot")
+
+
+class LogEvent(NamedTuple):
+    """A chat/join/leave read from the server log by the vanilla bridge.
+
+    Carries the same attributes process_events reads off a DiscordEvent row,
+    so both sources go through one code path to Discord.
+    """
+
+    event_type: str
+    player_name: str
+    player_uuid: str
+    message: Optional[str] = None
 
 
 class MinecraftBridge(commands.Cog):
@@ -156,16 +170,32 @@ class MinecraftBridge(commands.Cog):
         # already had its kill. Both reset when the log rotates (new boot).
         self._log_saved_at: Optional[float] = None
         self._stuck_kill_sent: bool = False
-        # Database manager for Discord events
-        self.db_manager: DatabaseManager = DatabaseManager(config.database, server_name)
+        # Database manager for Discord events. None on a vanilla bridge, which
+        # has no database - create_async_engine refuses an empty URL outright.
+        self.db_manager: Optional[DatabaseManager] = (
+            None
+            if config.minecraft.bridge == "vanilla"
+            else DatabaseManager(config.database, server_name)
+        )
         # name (lowercased) -> (member id or None, when the answer expires)
         self._mention_cache: dict[str, tuple[Optional[int], float]] = {}
+        # Vanilla bridge (no KubeJS in the pack): events come from the log,
+        # stats from vanilla commands, Discord chat goes out as tellraw.
+        self.vanilla: bool = config.minecraft.bridge == "vanilla"
+        # name -> uuid, learned from the login line, for avatars.
+        self._uuids: dict[str, str] = {}
+        # Wall-clock boot time of the running server - the uptime /getstats
+        # reports on a KubeJS server. Asked of the panel once per boot.
+        self._boot_at: Optional[float] = None
 
     async def cog_load(self) -> None:
         """Called when cog is loaded."""
         self.http_session = aiohttp.ClientSession()
+        if self.vanilla:
+            # No database in this mode: events arrive through watch_server_log.
+            self.log.info("Vanilla bridge - relaying chat from the server log")
         # Initialize database connection
-        if await self.db_manager.initialize():
+        elif await self.db_manager.initialize():
             self.poll_discord_events.start()
         else:
             self.log.warning("Database not available - discord events polling disabled")
@@ -187,7 +217,8 @@ class MinecraftBridge(commands.Cog):
         if self.http_session:
             await self.http_session.close()
         self._rcon_disconnect()
-        await self.db_manager.close()
+        if self.db_manager is not None:
+            await self.db_manager.close()
 
     async def setup_webhook(self) -> None:
         """Get or create a webhook for the configured channel."""
@@ -376,6 +407,8 @@ class MinecraftBridge(commands.Cog):
 
     async def get_stats_via_rcon(self) -> Optional[dict]:
         """Get server stats via RCON /getstats command."""
+        if self.vanilla:
+            return await self.get_vanilla_stats()
         response = await self.send_rcon_command("getstats")
         if response is None:
             return None
@@ -385,6 +418,94 @@ class MinecraftBridge(commands.Cog):
         except json.JSONDecodeError as e:
             self.log.warning(f"Invalid JSON from /getstats: {e}")
             return None
+
+    # --- Vanilla bridge: stats -------------------------------------------
+    # Over RCON, 1.12.2 runs a command's output lines together with no
+    # separator: "There are 1/10 players online:Fox (uuid), Bee (uuid)", and
+    # "forge tps" runs each dimension straight into the next. Player names are
+    # 1-16 word characters, which is what keeps that parseable.
+    VANILLA_LIST_RE = re.compile(r"There are (\d+)/\d+ players online:(.*)", re.S)
+    VANILLA_LIST_PLAYER_RE = re.compile(r"([A-Za-z0-9_]{1,16})(?: \(([0-9a-fA-F-]{36})\))?")
+    FORGE_TPS_RE = re.compile(r"Overall\s*:.*?Mean TPS:\s*([\d.]+)", re.S)
+
+    @classmethod
+    def parse_vanilla_list(cls, text: str) -> Optional[tuple[int, list[dict]]]:
+        """(player count, [{"name", "uuid"}]) from 'list uuids', or None."""
+        m = cls.VANILLA_LIST_RE.search(text)
+        if not m:
+            return None
+        players = [
+            {"name": name, "uuid": uuid}
+            for name, uuid in cls.VANILLA_LIST_PLAYER_RE.findall(m.group(2))
+        ]
+        return int(m.group(1)), players
+
+    @classmethod
+    def parse_forge_tps(cls, text: Optional[str]) -> Optional[float]:
+        """The 'Overall' mean TPS from 'forge tps', capped at 20, or None."""
+        if not text:
+            return None
+        m = cls.FORGE_TPS_RE.search(text)
+        return min(20.0, float(m.group(1))) if m else None
+
+    @staticmethod
+    def format_uptime(seconds: float) -> str:
+        """Same shape as the KubeJS getstats uptime: '2d 3h 4m' / '3h 4m'."""
+        minutes = int(seconds // 60)
+        hours, minutes = divmod(minutes, 60)
+        days, hours = divmod(hours, 24)
+        if days:
+            return f"{days}d {hours}h {minutes}m"
+        return f"{hours}h {minutes}m"
+
+    async def _vanilla_uptime(self) -> str:
+        """Uptime of the running server, asked of the panel once per boot.
+
+        Vanilla has no uptime command. Without panel access (no [pterodactyl]
+        table) it counts from when this bot first saw the server up.
+        """
+        if self._boot_at is None:
+            seconds = None
+            ptero = getattr(self.bot.get_cog("RestartCommands"), "ptero", None)
+            if ptero is not None:
+                try:
+                    seconds = await ptero.uptime(self.config.minecraft.pterodactyl_id)
+                except Exception as e:
+                    self.log.debug(f"Panel uptime lookup failed: {e}")
+            self._boot_at = time.time() - (seconds or 0.0)
+        return self.format_uptime(time.time() - self._boot_at)
+
+    async def get_vanilla_stats(self) -> Optional[dict]:
+        """The getstats dict, built from vanilla 'list uuids' and 'forge tps'.
+
+        None only when RCON does not answer - that is what marks the server
+        offline. An answer that does not parse still means the server is up.
+        """
+        listing = await self.send_rcon_command("list uuids")
+        if listing is None:
+            return None
+        parsed = self.parse_vanilla_list(listing)
+        if parsed is None:
+            self.log.warning("Unexpected answer to 'list uuids': %r", listing[:120])
+            parsed = (0, [])
+        count, players = parsed
+        for player in players:
+            # mc-heads.net takes a name as readily as a uuid, so an avatar
+            # still renders when neither 'list' nor the login line gave one.
+            player["uuid"] = (
+                player["uuid"] or self._uuids.get(player["name"].lower()) or player["name"]
+            )
+
+        tps = self.parse_forge_tps(await self.send_rcon_command("forge tps"))
+        if tps is None:
+            tps = (self.last_stats or {}).get("tps", 20.0)
+
+        return {
+            "tps": tps,
+            "playerCount": count,
+            "players": players,
+            "uptime": await self._vanilla_uptime(),
+        }
 
     async def send_webhook_message(
         self,
@@ -787,6 +908,7 @@ class MinecraftBridge(commands.Cog):
 
             if self.server_online and unreachable_for >= window:
                 self.server_online = False
+                self._boot_at = None  # the next boot has its own uptime
                 # Only notify if cooldown has passed
                 if now - self.last_status_notification >= self.STATUS_COOLDOWN:
                     server_name = self.config.minecraft.server_name
@@ -906,9 +1028,64 @@ class MinecraftBridge(commands.Cog):
     # (DeceasedCraft: the voice chat thread) and only a kill ends it.
     LOG_SAVED_MARKER = "All dimensions are saved"
     STOP_SAVED_GRACE: float = 90.0
-    # Only inspect the tail of a burst; a crashing server can emit a very
-    # large report and none of it changes the verdict.
+    # Only inspect the tail of a burst for crash markers; a crashing server can
+    # emit a very large report and none of it changes the verdict.
     LOG_MAX_LINES_PER_TICK = 400
+    # How much of a burst is read at all. The vanilla bridge needs every line,
+    # not the tail - chat buried in a burst of mod output must still be
+    # relayed - and a whole boot log (a new file after rotation) is a few
+    # thousand lines.
+    LOG_MAX_LINES_READ = 20000
+
+    # --- Vanilla bridge: events from the log -----------------------------
+    # 1.12.2 logs chat, joins and leaves through the server's sendMessage, so
+    # they appear under the DedicatedServer logger (MinecraftServer on other
+    # setups) and nowhere else. Anchoring on the logger is what stops a mod
+    # printing "<x> y" from being relayed as chat. The thread is not anchored:
+    # 1.12 handles chat on a Netty IO thread, not the server thread.
+    VANILLA_LOG_RE = re.compile(
+        r"^\[[\d:]+\] \[[^\]]+/INFO\] "
+        r"\[(?:minecraft/|net\.minecraft\.server\.(?:dedicated\.)?)(?:Dedicated|Minecraft)Server\]: (.*)$"
+    )
+    VANILLA_CHAT_RE = re.compile(r"^<([A-Za-z0-9_]{1,16})> (.+)$")
+    VANILLA_JOIN_RE = re.compile(r"^([A-Za-z0-9_]{1,16}) joined the game$")
+    VANILLA_LEAVE_RE = re.compile(r"^([A-Za-z0-9_]{1,16}) left the game$")
+    # The login handler's line, just before the join: the only place the log
+    # carries a player's uuid. Anchored on its logger so chat cannot forge it.
+    VANILLA_UUID_RE = re.compile(
+        r"^\[[\d:]+\] \[[^\]]+/INFO\] "
+        r"\[(?:minecraft/|net\.minecraft\.server\.network\.)NetHandlerLoginServer\]: "
+        r"UUID of player ([A-Za-z0-9_]{1,16}) is ([0-9a-fA-F-]{36})$"
+    )
+
+    def parse_vanilla_log_line(self, line: str) -> Optional[LogEvent]:
+        """A chat/join/leave event from one log line, or None.
+
+        Also remembers name -> uuid from login lines, for avatars.
+        """
+        line = line.rstrip("\r\n")
+        m = self.VANILLA_UUID_RE.match(line)
+        if m:
+            self._uuids[m.group(1).lower()] = m.group(2)
+            return None
+        m = self.VANILLA_LOG_RE.match(line)
+        if not m:
+            return None
+        text = m.group(1)
+
+        def uuid_of(name: str) -> str:
+            return self._uuids.get(name.lower()) or name
+
+        if chat := self.VANILLA_CHAT_RE.match(text):
+            name = chat.group(1)
+            return LogEvent("chat", name, uuid_of(name), chat.group(2))
+        if join := self.VANILLA_JOIN_RE.match(text):
+            name = join.group(1)
+            return LogEvent("join", name, uuid_of(name))
+        if leave := self.VANILLA_LEAVE_RE.match(text):
+            name = leave.group(1)
+            return LogEvent("leave", name, uuid_of(name))
+        return None
 
     def _read_new_log_lines(self) -> list[str]:
         """Return log lines written since the last read.
@@ -935,6 +1112,7 @@ class MinecraftBridge(commands.Cog):
             # A new file is a new boot: the previous stop is over, however it ended.
             self._log_saved_at = None
             self._stuck_kill_sent = False
+            self._boot_at = None
 
         if stat.st_size == self._log_pos:
             return []
@@ -948,7 +1126,7 @@ class MinecraftBridge(commands.Cog):
             self.log.debug(f"Could not read server log: {e}")
             return []
 
-        return data.splitlines()[-self.LOG_MAX_LINES_PER_TICK:]
+        return data.splitlines()[-self.LOG_MAX_LINES_READ:]
 
     @tasks.loop(seconds=5)
     async def watch_server_log(self) -> None:
@@ -964,7 +1142,12 @@ class MinecraftBridge(commands.Cog):
         loop = asyncio.get_event_loop()
         lines = await loop.run_in_executor(None, self._read_new_log_lines)
 
-        for line in lines:
+        if self.vanilla:
+            events = [e for e in map(self.parse_vanilla_log_line, lines) if e is not None]
+            if events:
+                await self.process_events(events)
+
+        for line in lines[-self.LOG_MAX_LINES_PER_TICK:]:
             if self.LOG_STUCK_STOP_MARKER in line:
                 await self._kill_stuck_stop(line.strip()[:160])
                 return
@@ -1045,6 +1228,10 @@ class MinecraftBridge(commands.Cog):
 
     @watch_server_log.before_loop
     async def before_watch_log(self) -> None:
+        if self.vanilla:
+            # The log is this bridge's chat feed, so it is read as often as a
+            # KubeJS bridge polls its events table, not at crash-watch pace.
+            self.watch_server_log.change_interval(seconds=self.config.settings.events_poll_interval)
         await self.bot.wait_until_ready()
 
     @watch_server_log.error
@@ -1076,6 +1263,25 @@ class MinecraftBridge(commands.Cog):
             content = content[: max_len - 3] + "..."
 
         return content
+
+    @staticmethod
+    def vanilla_tellraw(username: str, content: str) -> str:
+        """The vanilla stand-in for KubeJS /discordmsg: same look in game,
+        '[Discord] name: message' in gray/blue/aqua/white.
+
+        Not ASCII-escaped: 1.12.2 RCON reads UTF-8, and a \\uXXXX per letter
+        would push a 256-character Cyrillic message past its 1460-byte packet.
+        """
+        parts = [
+            "",
+            {"text": "[", "color": "gray"},
+            {"text": "Discord", "color": "blue"},
+            {"text": "] ", "color": "gray"},
+            {"text": username, "color": "aqua"},
+            {"text": ": ", "color": "white"},
+            {"text": content, "color": "white"},
+        ]
+        return "tellraw @a " + json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
 
     def sanitize_username(self, username: str) -> str:
         """Sanitize Discord username for Minecraft command."""
@@ -1113,7 +1319,10 @@ class MinecraftBridge(commands.Cog):
             return
 
         username = self.sanitize_username(message.author.display_name)
-        command = f'discordmsg "{username}" {content}'
+        if self.vanilla:
+            command = self.vanilla_tellraw(username, content)
+        else:
+            command = f'discordmsg "{username}" {content}'
 
         self.log.info(f"Relaying message from {username}: {content[:50]}...")
 
