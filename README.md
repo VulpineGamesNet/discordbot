@@ -10,6 +10,7 @@ Currently bridging:
 |---|---|---|---|
 | ATM10 | All The Mods 10 | 1.21.1 | NeoForge |
 | DeceasedCraft | DeceasedCraft — Urban Zombie Apocalypse (Beta 5.10.x) | 1.20.1 | Forge |
+| RLCraft | RLCraft 2.9.3 (`bridge = "vanilla"`) | 1.12.2 | Forge |
 
 ## How it works
 
@@ -21,6 +22,30 @@ Discord   ──message──────────> bot ──RCON /discordms
 
 The Minecraft half is a KubeJS script — see [`minecraft/`](minecraft/). Both
 halves live in this repo so they version together.
+
+### Packs without KubeJS (`bridge = "vanilla"`)
+
+KubeJS does not exist for Minecraft 1.12.2, so a server like RLCraft runs with
+nothing installed in the pack:
+
+```
+Minecraft ──chat/join/leave──> latest.log ──tail (log_path)──> bot ──webhook──> Discord
+Discord   ──message──────────> bot ──RCON tellraw @a──────────> Minecraft
+                               bot ──RCON list uuids + forge tps──> players, TPS
+                               bot ──panel client API─────────> uptime (once per boot)
+```
+
+- Chat is read from the lines the server itself logs (`<name> text`,
+  `name joined the game`, `name left the game`) under the `DedicatedServer` /
+  `MinecraftServer` logger only, so mod output that happens to look like chat
+  is not relayed. Avatars use the uuid from the `UUID of player … is …` login
+  line, falling back to the name.
+- Discord messages arrive in game looking exactly like `/discordmsg`'s
+  (`[Discord] name: text`), sent as UTF-8 so a full 256-character message in any
+  script fits 1.12's 1460-byte RCON packet.
+- Needs `log_path` (mount the log *directory*); takes no `database_url`.
+  Uptime needs the `[pterodactyl]` table; without it, it counts from when the
+  bot first saw the server up.
 
 ## Features
 
@@ -197,7 +222,9 @@ Settings → Integrations → (the bot) → `/restart` and `/restart-cancel`**.
 
 Append a `[[servers]]` block to `config.toml`, add its two secrets to `.env`,
 install the KubeJS script on that server, `docker compose restart`. No code
-change and no slash-command re-sync.
+change and no slash-command re-sync. A `bridge = "vanilla"` server needs only
+its RCON password in `.env`, no KubeJS, and its log directory mounted in
+`docker-compose.yml` (a new mount is `docker compose up -d`, not a restart).
 
 ## Discord bot permissions
 

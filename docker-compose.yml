@@ -23,6 +23,9 @@ services:
       # container would keep reading the old, frozen file forever.
       - /var/lib/pterodactyl/volumes/284c8202-2eb5-4ba2-b7b9-519145422945/logs:/app/serverlogs/atm10:ro
       - /var/lib/pterodactyl/volumes/70aeb1c6-a11a-4ad9-90bc-bc3590e0f0d0/logs:/app/serverlogs/dc:ro
+      # RLCraft runs bridge = "vanilla": this log is its chat feed as well as
+      # its crash watch.
+      - /var/lib/pterodactyl/volumes/0f1efd20-2d5f-4180-a95c-1d41cadac0c4/logs:/app/serverlogs/rlcraft:ro
       # RCON pause flag. /restart raises it just before the power signal so
       # every RCON client goes quiet first; otherwise a command in flight parks
       # the server's RCON thread and the stop hangs until wings kills it (ten
@@ -35,6 +38,9 @@ services:
       # on 2026-08-26 and the votifier's mount went on reading the orphaned
       # inode for ten days without a single error line.
       - /var/lib/pterodactyl/volumes/284c8202-2eb5-4ba2-b7b9-519145422945/votifier_flags:/app/flags/atm10:rw
+      # RLCraft polls two vanilla commands every check, so it gets the same
+      # protection. Nothing in the pack reads it - only this bot.
+      - /var/lib/pterodactyl/volumes/0f1efd20-2d5f-4180-a95c-1d41cadac0c4/votifier_flags:/app/flags/rlcraft:rw
     networks:
       pterodactyl_nw:
         # Fixed address so the Pterodactyl client API key used by /restart can
