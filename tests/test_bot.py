@@ -1589,7 +1589,28 @@ class TestServerLogWatch:
         bridge, log = log_bridge
         panel = self._panel(bridge)
         bridge.STOP_SAVED_GRACE = 0
-        with patch.object(bridge, "dm_owner", new_callable=AsyncMock):
+        with patch.object(bridge, "dm_owner", new_callable=AsyncMock), \
+                patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("[12:20:36] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: Stopping server\n")
+                f.write("[12:20:38] [Server thread/INFO]: ThreadedAnvilChunkStorage: All dimensions are saved\n")
+            await bridge.watch_server_log()
+            await bridge.watch_server_log()
+        panel.power.assert_awaited_once_with(bridge.config.minecraft.pterodactyl_id, "kill")
+
+    @pytest.mark.asyncio
+    async def test_stop_line_in_an_earlier_burst_still_arms(self, log_bridge):
+        """The stop and the save can land in different reads of the log."""
+        bridge, log = log_bridge
+        panel = self._panel(bridge)
+        bridge.STOP_SAVED_GRACE = 0
+        with patch.object(bridge, "dm_owner", new_callable=AsyncMock), \
+                patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("[12:20:36] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: Stopping server\n")
+                f.write("mod shutdown noise\n" * (bridge.LOG_MAX_LINES_PER_TICK + 50))
             await bridge.watch_server_log()
             with open(log, "a") as f:
                 f.write("[12:20:38] [Server thread/INFO]: ThreadedAnvilChunkStorage: All dimensions are saved\n")
@@ -1598,15 +1619,74 @@ class TestServerLogWatch:
         panel.power.assert_awaited_once_with(bridge.config.minecraft.pterodactyl_id, "kill")
 
     @pytest.mark.asyncio
+    async def test_save_all_flush_on_running_server_is_not_killed(self, log_bridge):
+        """2026-11-07: the ATM10 backup schedule (save-off, save-all flush,
+        backup) prints the save line on a running server. The bot took it for
+        a hung stop and killed ATM10 90s later, mid-backup."""
+        bridge, log = log_bridge
+        panel = self._panel(bridge)
+        bridge.STOP_SAVED_GRACE = 0
+        with patch.object(bridge, "dm_owner", new_callable=AsyncMock) as dm:
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("[23:06:06] [Server thread/INFO] [minecraft/MinecraftServer]: Automatic saving is now disabled\n")
+                f.write("[23:06:14] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: "
+                        "ThreadedAnvilChunkStorage: All dimensions are saved\n")
+                f.write("[23:06:14] [Server thread/INFO] [minecraft/MinecraftServer]: Saved the game\n")
+            await bridge.watch_server_log()
+            await bridge.watch_server_log()
+        panel.power.assert_not_awaited()
+        dm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_chat_cannot_arm_the_kill(self, log_bridge):
+        bridge, log = log_bridge
+        panel = self._panel(bridge)
+        bridge.STOP_SAVED_GRACE = 0
+        with patch.object(bridge, "dm_owner", new_callable=AsyncMock), \
+                patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("[23:05:00] [Server thread/INFO] [minecraft/MinecraftServer]: <Steve> Stopping server soon?\n")
+                f.write("[23:06:14] [Server thread/INFO]: ThreadedAnvilChunkStorage: All dimensions are saved\n")
+            await bridge.watch_server_log()
+            await bridge.watch_server_log()
+        panel.power.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rotation_clears_the_stop(self, log_bridge):
+        """A stop seen on the last boot must not arm a flush on the next one."""
+        bridge, log = log_bridge
+        panel = self._panel(bridge, state="offline")
+        bridge.STOP_SAVED_GRACE = 0
+        with patch.object(bridge, "dm_owner", new_callable=AsyncMock), \
+                patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write("[12:20:36] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: Stopping server\n")
+            await bridge.watch_server_log()
+            log.unlink()                                                  # next boot
+            log.write_text("[13:00:00] [Server thread/INFO]: booting\n")
+            await bridge.watch_server_log()
+            panel.state.return_value = "running"
+            with open(log, "a") as f:
+                f.write("[14:00:00] [Server thread/INFO]: ThreadedAnvilChunkStorage: All dimensions are saved\n")
+            await bridge.watch_server_log()
+            await bridge.watch_server_log()
+        panel.power.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_gone_server_is_not_killed(self, log_bridge):
         """A normal stop passes the save line too; by the time the grace is up
         the panel says offline, or the new boot has rotated the log."""
         bridge, log = log_bridge
         panel = self._panel(bridge, state="offline")
         bridge.STOP_SAVED_GRACE = 0
-        with patch.object(bridge, "dm_owner", new_callable=AsyncMock):
+        with patch.object(bridge, "dm_owner", new_callable=AsyncMock), \
+                patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock):
             await bridge.watch_server_log()
             with open(log, "a") as f:
+                f.write("[12:20:36] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: Stopping server\n")
                 f.write("All dimensions are saved\n")
             await bridge.watch_server_log()
         panel.power.assert_not_awaited()
