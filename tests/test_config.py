@@ -265,3 +265,46 @@ class TestPterodactylConfig:
         text = TWO_SERVERS + '\n[pterodactyl]\nurl = "https://panel.test"\n'
         with pytest.raises(ValueError, match="pterodactyl"):
             load_config(write_config(text), env_file=None)
+
+
+VANILLA = """
+[discord]
+token = "t"
+
+[[servers]]
+name = "RL"
+channel_id = 333
+rcon_password = "p"
+bridge = "vanilla"
+log_path = "/app/serverlogs/rl/latest.log"
+"""
+
+
+class TestBridgeMode:
+    """bridge = "kubejs" (default) or "vanilla"."""
+
+    def test_default_is_kubejs(self, write_config):
+        cfg = load_config(write_config(TWO_SERVERS), env_file=None)
+        assert {s.minecraft.bridge for s in cfg.servers} == {"kubejs"}
+
+    def test_vanilla_needs_no_database(self, write_config):
+        cfg = load_config(write_config(VANILLA), env_file=None)
+        server = cfg.servers[0]
+        assert server.minecraft.bridge == "vanilla"
+        assert server.database.url == ""
+        assert server.minecraft.log_path == "/app/serverlogs/rl/latest.log"
+
+    def test_vanilla_requires_log_path(self, write_config):
+        text = VANILLA.replace('log_path = "/app/serverlogs/rl/latest.log"\n', "")
+        with pytest.raises(ValueError, match="log_path"):
+            load_config(write_config(text), env_file=None)
+
+    def test_kubejs_still_requires_database(self, write_config):
+        text = VANILLA.replace('bridge = "vanilla"', 'bridge = "kubejs"')
+        with pytest.raises(ValueError, match="database_url"):
+            load_config(write_config(text), env_file=None)
+
+    def test_unknown_mode_raises(self, write_config):
+        text = VANILLA.replace('"vanilla"', '"fabric"')
+        with pytest.raises(ValueError, match="bridge must be one of"):
+            load_config(write_config(text), env_file=None)

@@ -97,3 +97,17 @@ log_path      = "/app/serverlogs/dc/latest.log"
 # detection on a wedged server does not eat the grace period.
 offline_threshold = 4
 status_cooldown   = 10
+
+# A pack with no KubeJS (RLCraft, Minecraft 1.12.2 Forge): nothing is installed
+# in the pack. Chat, joins and leaves are read from the server log, stats come
+# from vanilla "list uuids" + "forge tps" (uptime from the panel, when
+# [pterodactyl] is set), and Discord messages go out as vanilla tellraw.
+# log_path is required and doubles as the chat feed; no database_url.
+[[servers]]
+name          = "Vulpine RLCraft"
+channel_id    = 333333333333333333
+rcon_host     = "0f1efd20-2d5f-4180-a95c-1d41cadac0c4"
+rcon_port     = 25575
+rcon_password = "${RLCRAFT_RCON_PASSWORD}"
+bridge        = "vanilla"
+log_path      = "/app/serverlogs/rlcraft/latest.log"

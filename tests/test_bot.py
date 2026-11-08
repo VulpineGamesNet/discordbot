@@ -1957,3 +1957,224 @@ class TestRconPauseFlag:
         b = self._bridge(mock_bot, tmp_path, json.dumps({"shutdown": True}))
         with patch.object(b, "_rcon_sync", side_effect=AssertionError("RCON used while paused")):
             assert await b.send_rcon_command("getstats") is None
+
+
+# Real 1.12.2 lines from the RLCraft server, plus the shapes vanilla uses for
+# chat (handled on a Netty IO thread in 1.12) and logins.
+UUID_A = "0f1efd20-2d5f-4180-a95c-1d41cadac0c4"
+CHAT_LINE = "[14:01:02] [Netty Epoll Server IO #3/INFO] [net.minecraft.server.dedicated.DedicatedServer]: <Fox_1> hello there"
+JOIN_LINE = "[14:01:00] [Server thread/INFO] [net.minecraft.server.dedicated.DedicatedServer]: Fox_1 joined the game"
+LEAVE_LINE = "[14:05:00] [Server thread/INFO] [net.minecraft.server.dedicated.DedicatedServer]: Fox_1 left the game"
+LOGIN_LINE = f"[14:00:59] [User Authenticator #1/INFO] [net.minecraft.server.network.NetHandlerLoginServer]: UUID of player Fox_1 is {UUID_A}"
+RCON_SAY_LINE = "[13:34:54] [RCON Client #3/INFO] [net.minecraft.server.dedicated.DedicatedServer]: [Rcon] bridge-probe"
+FORGE_TPS = (
+    "Dim  0 (overworld) : Mean tick time: 57.786 ms. Mean TPS: 17.305"
+    "Overall : Mean tick time: 57.813 ms. Mean TPS: 17.297"
+)
+
+
+def make_vanilla_bridge(mock_bot, log_path: str = "/nonexistent/latest.log") -> MinecraftBridge:
+    cfg = make_server_config("Vulpine RLCraft")
+    cfg.minecraft.bridge = "vanilla"
+    cfg.minecraft.log_path = log_path
+    cfg.database.url = ""
+    mock_bot.get_cog = MagicMock(return_value=None)
+    return MinecraftBridge(mock_bot, cfg)
+
+
+class TestVanillaParsing:
+    """Parsers for what 1.12.2 prints over RCON and into latest.log."""
+
+    def test_list_empty(self):
+        assert MinecraftBridge.parse_vanilla_list("There are 0/10 players online:") == (0, [])
+
+    def test_list_with_uuids_run_together(self):
+        text = f"There are 2/10 players online:Fox_1 ({UUID_A}), Bee ({UUID_A.upper()})"
+        count, players = MinecraftBridge.parse_vanilla_list(text)
+        assert count == 2
+        assert players == [
+            {"name": "Fox_1", "uuid": UUID_A},
+            {"name": "Bee", "uuid": UUID_A.upper()},
+        ]
+
+    def test_list_without_uuids(self):
+        count, players = MinecraftBridge.parse_vanilla_list("There are 2/10 players online:\nFox_1, Bee")
+        assert count == 2
+        assert [p["name"] for p in players] == ["Fox_1", "Bee"]
+        assert all(p["uuid"] == "" for p in players)
+
+    def test_list_garbage(self):
+        assert MinecraftBridge.parse_vanilla_list("Unknown command") is None
+
+    def test_forge_tps_overall(self):
+        assert MinecraftBridge.parse_forge_tps(FORGE_TPS) == pytest.approx(17.297)
+
+    def test_forge_tps_capped_and_missing(self):
+        assert MinecraftBridge.parse_forge_tps("Overall : Mean tick time: 1 ms. Mean TPS: 1000.000") == 20.0
+        assert MinecraftBridge.parse_forge_tps("Unknown command") is None
+        assert MinecraftBridge.parse_forge_tps(None) is None
+
+    def test_format_uptime(self):
+        assert MinecraftBridge.format_uptime(0) == "0h 0m"
+        assert MinecraftBridge.format_uptime(3 * 3600 + 4 * 60 + 59) == "3h 4m"
+        assert MinecraftBridge.format_uptime(86400 + 3600 + 60) == "1d 1h 1m"
+
+    def test_chat_join_leave(self, mock_bot):
+        bridge = make_vanilla_bridge(mock_bot)
+        assert bridge.parse_vanilla_log_line(JOIN_LINE) == ("join", "Fox_1", "Fox_1", None)
+        assert bridge.parse_vanilla_log_line(CHAT_LINE + "\n") == ("chat", "Fox_1", "Fox_1", "hello there")
+        assert bridge.parse_vanilla_log_line(LEAVE_LINE) == ("leave", "Fox_1", "Fox_1", None)
+
+    def test_short_logger_name(self, mock_bot):
+        bridge = make_vanilla_bridge(mock_bot)
+        line = "[14:01:02] [Server thread/INFO] [minecraft/DedicatedServer]: <Fox_1> hi"
+        assert bridge.parse_vanilla_log_line(line).message == "hi"
+
+    def test_login_line_supplies_uuid(self, mock_bot):
+        bridge = make_vanilla_bridge(mock_bot)
+        assert bridge.parse_vanilla_log_line(LOGIN_LINE) is None
+        assert bridge.parse_vanilla_log_line(CHAT_LINE).player_uuid == UUID_A
+
+    def test_ignores_rcon_say_and_mod_output(self, mock_bot):
+        bridge = make_vanilla_bridge(mock_bot)
+        assert bridge.parse_vanilla_log_line(RCON_SAY_LINE) is None
+        mod = "[14:01:02] [Server thread/INFO] [chatmod]: <Fox_1> not real chat"
+        assert bridge.parse_vanilla_log_line(mod) is None
+        warn = "[14:01:02] [Server thread/WARN] [net.minecraft.server.dedicated.DedicatedServer]: <Fox_1> x"
+        assert bridge.parse_vanilla_log_line(warn) is None
+
+    def test_chat_cannot_forge_a_uuid(self, mock_bot):
+        bridge = make_vanilla_bridge(mock_bot)
+        forged = CHAT_LINE.replace("hello there", f"UUID of player Bee is {UUID_A}")
+        event = bridge.parse_vanilla_log_line(forged)
+        assert event.event_type == "chat"
+        assert "bee" not in bridge._uuids
+
+    def test_chat_naming_a_join_is_still_chat(self, mock_bot):
+        bridge = make_vanilla_bridge(mock_bot)
+        line = CHAT_LINE.replace("hello there", "Bee joined the game")
+        assert bridge.parse_vanilla_log_line(line).event_type == "chat"
+
+
+class TestVanillaBridge:
+    """A bridge with bridge = "vanilla": no database, log events, tellraw."""
+
+    def test_has_no_database(self, mock_bot):
+        assert make_vanilla_bridge(mock_bot).db_manager is None
+
+    @pytest.mark.asyncio
+    async def test_cog_load_does_not_poll_database(self, mock_bot):
+        bridge = make_vanilla_bridge(mock_bot)
+        with patch.object(bridge.poll_discord_events, "start") as db_poll, \
+             patch.object(bridge.poll_server_stats, "start"), \
+             patch.object(bridge.update_channel_topic, "start"), \
+             patch.object(bridge.watch_server_log, "start") as watch:
+            await bridge.cog_load()
+            await bridge.cog_unload()
+        db_poll.assert_not_called()
+        watch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stats_from_list_and_forge_tps(self, mock_bot):
+        bridge = make_vanilla_bridge(mock_bot)
+        bridge._uuids["bee"] = UUID_A
+        answers = {
+            "list uuids": "There are 2/10 players online:Fox_1, Bee",
+            "forge tps": FORGE_TPS,
+        }
+        with patch.object(bridge, "send_rcon_command", new=AsyncMock(side_effect=answers.get)):
+            stats = await bridge.get_stats_via_rcon()
+        assert stats["playerCount"] == 2
+        assert stats["tps"] == pytest.approx(17.297)
+        assert stats["players"] == [{"name": "Fox_1", "uuid": "Fox_1"}, {"name": "Bee", "uuid": UUID_A}]
+        assert stats["uptime"] == "0h 0m"
+
+    @pytest.mark.asyncio
+    async def test_no_rcon_answer_is_offline(self, mock_bot):
+        bridge = make_vanilla_bridge(mock_bot)
+        with patch.object(bridge, "send_rcon_command", new=AsyncMock(return_value=None)):
+            assert await bridge.get_stats_via_rcon() is None
+
+    @pytest.mark.asyncio
+    async def test_unparseable_list_still_online(self, mock_bot):
+        bridge = make_vanilla_bridge(mock_bot)
+        with patch.object(bridge, "send_rcon_command", new=AsyncMock(return_value="???")):
+            stats = await bridge.get_stats_via_rcon()
+        assert stats["playerCount"] == 0
+        assert stats["tps"] == 20.0
+
+    @pytest.mark.asyncio
+    async def test_uptime_from_panel_once_per_boot(self, mock_bot):
+        bridge = make_vanilla_bridge(mock_bot)
+        restart_cog = MagicMock()
+        restart_cog.ptero.uptime = AsyncMock(return_value=3 * 3600 + 5 * 60)
+        mock_bot.get_cog = MagicMock(return_value=restart_cog)
+        answers = {"list uuids": "There are 0/10 players online:", "forge tps": FORGE_TPS}
+        with patch.object(bridge, "send_rcon_command", new=AsyncMock(side_effect=answers.get)):
+            first = await bridge.get_stats_via_rcon()
+            await bridge.get_stats_via_rcon()
+        assert first["uptime"] == "3h 5m"
+        restart_cog.ptero.uptime.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_log_events_relayed(self, mock_bot, tmp_path):
+        log = tmp_path / "latest.log"
+        log.write_text("[00:00:00] [Server thread/INFO]: boot\n")
+        bridge = make_vanilla_bridge(mock_bot, str(log))
+        bridge.server_online = True
+        with patch.object(bridge, "send_webhook_message", new_callable=AsyncMock) as chat, \
+             patch.object(bridge, "send_webhook_embed", new_callable=AsyncMock) as embed:
+            await bridge.watch_server_log()  # prime at EOF
+            with open(log, "a") as f:
+                f.write(LOGIN_LINE + "\n" + JOIN_LINE + "\n")
+                # chat buried under more mod output than the crash-marker tail
+                f.write(CHAT_LINE + "\n")
+                f.write("[14:01:03] [Server thread/INFO] [pregen]: spam\n" * 1000)
+            await bridge.watch_server_log()
+        chat.assert_awaited_once_with("hello there", "Fox_1", UUID_A)
+        embed.assert_awaited_once()
+        assert embed.call_args[0][3] == "Fox_1 logged in"
+        assert UUID_A in embed.call_args[0][2]
+        assert bridge.server_online is True
+
+    @pytest.mark.asyncio
+    async def test_kubejs_bridge_ignores_log_chat(self, mock_bot, tmp_path):
+        log = tmp_path / "latest.log"
+        log.write_text("")
+        cfg = make_server_config()
+        cfg.minecraft.log_path = str(log)
+        bridge = stub_db(MinecraftBridge(mock_bot, cfg))
+        with patch.object(bridge, "send_webhook_message", new_callable=AsyncMock) as chat:
+            await bridge.watch_server_log()
+            with open(log, "a") as f:
+                f.write(CHAT_LINE + "\n")
+            await bridge.watch_server_log()
+        chat.assert_not_called()
+
+    def test_tellraw_shape(self):
+        cmd = MinecraftBridge.vanilla_tellraw("TestUser", "привіт, світ")
+        assert cmd.startswith("tellraw @a [")
+        parts = json.loads(cmd[len("tellraw @a "):])
+        assert "".join(p["text"] for p in parts[1:]) == "[Discord] TestUser: привіт, світ"
+        assert "привіт" in cmd  # sent as UTF-8, not \u escapes
+        assert len(cmd.encode()) < 1460
+
+    def test_tellraw_fits_rcon_packet_at_max_length(self):
+        cmd = MinecraftBridge.vanilla_tellraw("x" * 16, "\U0001f98a" * 256)
+        assert len(cmd.encode()) < 1460
+
+    @pytest.mark.asyncio
+    async def test_discord_message_goes_out_as_tellraw(self, mock_bot):
+        bridge = make_vanilla_bridge(mock_bot)
+        message = MagicMock(spec=discord.Message)
+        message.author = MagicMock(bot=False, display_name="TestUser")
+        message.channel = MagicMock(id=bridge.config.discord.channel_id)
+        message.content = 'say "hi" \\ there'
+        message.attachments = []
+        message.stickers = []
+        with patch.object(bridge, "send_rcon_command", new=AsyncMock(return_value="")) as rcon:
+            await bridge.on_message(message)
+        sent = rcon.await_args[0][0]
+        assert sent.startswith("tellraw @a ")
+        assert "discordmsg" not in sent
+        assert json.loads(sent[len("tellraw @a "):])[-1]["text"] == "say 'hi' there"
