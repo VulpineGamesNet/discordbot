@@ -170,6 +170,9 @@ class MinecraftBridge(commands.Cog):
         # already had its kill. Both reset when the log rotates (new boot).
         self._log_saved_at: Optional[float] = None
         self._stuck_kill_sent: bool = False
+        # Whether the log has said "Stopping server" since this boot. Until it
+        # has, a save line is a 'save-all flush', not a stop.
+        self._stop_seen: bool = False
         # Database manager for Discord events. None on a vanilla bridge, which
         # has no database - create_async_engine refuses an empty URL outright.
         self.db_manager: Optional[DatabaseManager] = (
@@ -1028,6 +1031,12 @@ class MinecraftBridge(commands.Cog):
     # (DeceasedCraft: the voice chat thread) and only a kill ends it.
     LOG_SAVED_MARKER = "All dimensions are saved"
     STOP_SAVED_GRACE: float = 90.0
+    # The save line only means a stop once the server has said it is stopping:
+    # 'save-all flush' prints the same line on a running server, and the ATM10
+    # backup schedule (save-off, save-all flush, backup) was killed 90s later
+    # on 2026-11-07. Anchored on the logger's "]: " so chat cannot forge it;
+    # all three packs log exactly this line at the start of a stop.
+    LOG_STOP_MARKER = "]: Stopping server"
     # Only inspect the tail of a burst for crash markers; a crashing server can
     # emit a very large report and none of it changes the verdict.
     LOG_MAX_LINES_PER_TICK = 400
@@ -1112,6 +1121,7 @@ class MinecraftBridge(commands.Cog):
             # A new file is a new boot: the previous stop is over, however it ended.
             self._log_saved_at = None
             self._stuck_kill_sent = False
+            self._stop_seen = False
             self._boot_at = None
 
         if stat.st_size == self._log_pos:
@@ -1147,11 +1157,17 @@ class MinecraftBridge(commands.Cog):
             if events:
                 await self.process_events(events)
 
+        # The stop line can sit before the tail of a long shutdown burst.
+        if any(self.LOG_STOP_MARKER in line for line in lines[:-self.LOG_MAX_LINES_PER_TICK]):
+            self._stop_seen = True
+
         for line in lines[-self.LOG_MAX_LINES_PER_TICK:]:
             if self.LOG_STUCK_STOP_MARKER in line:
                 await self._kill_stuck_stop(line.strip()[:160])
                 return
-            if self.LOG_SAVED_MARKER in line:
+            if self.LOG_STOP_MARKER in line:
+                self._stop_seen = True
+            if self.LOG_SAVED_MARKER in line and self._stop_seen:
                 self._log_saved_at = time.time()
             if self._crash_announced:
                 continue
